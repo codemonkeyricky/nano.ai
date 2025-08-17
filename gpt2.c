@@ -563,7 +563,7 @@ int main() {
     probs = malloc(top_k * sizeof(float));
 
     float *logits = malloc(vocab_size * sizeof(float));
-    while (k < 500) {
+    while (k < 100) {
         generate(logits, token, k++);
 
         // Top-k sampling

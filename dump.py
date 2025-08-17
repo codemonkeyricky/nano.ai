@@ -9,8 +9,8 @@ def dump_bin(tensor, filename, transpose=False):
         arr = arr.T
     arr.astype(np.float32).tofile(filename)
 
-def save_gpt2_tokenizer_bin(output_path):
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+def save_gpt2_tokenizer_bin(output_path, model_name="gpt2"):
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     tokens = [token for token, idx in sorted(tokenizer.encoder.items(), key=lambda x: x[1])]
     vocab_size = len(tokens)
     with open(output_path, "wb") as f:
@@ -36,7 +36,8 @@ def dump_config_bin(config, filename):
             f.write(int(value).to_bytes(4, "little"))
 
 def main():
-    model_name = "gpt2-xl"  # gpt2-small
+    # Possible models: gpt2, gpt2-medium, gpt2-large, gpt2-xl
+    model_name = "gpt2"  # gpt2-small
     out_dir = "./gpt2_weights"
     os.makedirs(out_dir, exist_ok=True)
     model = GPT2LMHeadModel.from_pretrained(model_name)
@@ -84,7 +85,7 @@ def main():
 
     # Dump tokenizer tokens
     tokenizer_bin_path = os.path.join(out_dir, "tokenizer.bin")
-    save_gpt2_tokenizer_bin(tokenizer_bin_path)
+    save_gpt2_tokenizer_bin(tokenizer_bin_path, model_name)
 
 if __name__ == "__main__":
     main()
