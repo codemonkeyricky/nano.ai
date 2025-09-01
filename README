@@ -1,15 +1,3 @@
-https://www.linkedin.com/posts/richard-tang-058a696_github-codemonkeyrickygpt2c-activity-7362706686995828738-G71r
-
-# Setup environment 
-python3 -m venv venv
-source venv/bin/activate
-pip install transformers 
-pip install torch 
-
-# Dump weights 
-python3 dump.py
-
-# Compile and run
-make 
-./gpt2c
-
+This project includes minimalistic (yet functional) implementations of AI
+inference engines. Each engine is contained in a single file, written in a few
+hundred lines of pure C without any external package dependencies.
