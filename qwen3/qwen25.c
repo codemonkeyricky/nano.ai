@@ -112,18 +112,18 @@ void mmap_layer(struct Transformer *x, int layer) {
     };
 
     struct mmap_lookup lookup[] = {
-        {"qwen_weights/layer_%d_input_layernorm.bin", &l->input_layernorm},
-        {"qwen_weights/layer_%d_q_proj_w.bin", &l->q_proj_w},
-        {"qwen_weights/layer_%d_k_proj_w.bin", &l->k_proj_w},
-        {"qwen_weights/layer_%d_v_proj_w.bin", &l->v_proj_w},
-        {"qwen_weights/layer_%d_q_proj_b.bin", &l->q_proj_b},
-        {"qwen_weights/layer_%d_k_proj_b.bin", &l->k_proj_b},
-        {"qwen_weights/layer_%d_v_proj_b.bin", &l->v_proj_b},
-        {"qwen_weights/layer_%d_o_proj_w.bin", &l->o_proj_w},
-        {"qwen_weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
-        {"qwen_weights/layer_%d_mlp_down_proj.bin", &l->mlp_down_proj},
-        {"qwen_weights/layer_%d_mlp_up_proj.bin", &l->mlp_up_proj},
-        {"qwen_weights/layer_%d_mlp_gate_proj.bin", &l->mlp_gate_proj},
+        {"weights/layer_%d_input_layernorm.bin", &l->input_layernorm},
+        {"weights/layer_%d_q_proj_w.bin", &l->q_proj_w},
+        {"weights/layer_%d_k_proj_w.bin", &l->k_proj_w},
+        {"weights/layer_%d_v_proj_w.bin", &l->v_proj_w},
+        {"weights/layer_%d_q_proj_b.bin", &l->q_proj_b},
+        {"weights/layer_%d_k_proj_b.bin", &l->k_proj_b},
+        {"weights/layer_%d_v_proj_b.bin", &l->v_proj_b},
+        {"weights/layer_%d_o_proj_w.bin", &l->o_proj_w},
+        {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
+        {"weights/layer_%d_mlp_down_proj.bin", &l->mlp_down_proj},
+        {"weights/layer_%d_mlp_up_proj.bin", &l->mlp_up_proj},
+        {"weights/layer_%d_mlp_gate_proj.bin", &l->mlp_gate_proj},
     };
 
     for (ssize_t i = 0; i < sizeof(lookup) / sizeof(lookup[0]); i++) {
@@ -141,7 +141,7 @@ void mmap_layer(struct Transformer *x, int layer) {
 }
 
 void mmap_init(struct Config *config, struct Mmapping *mmapping) {
-    int fd = open("qwen_weights/embeddings.bin", O_RDONLY);
+    int fd = open("weights/embeddings.bin", O_RDONLY);
     assert(fd > -1);
     int file_size = lseek(fd, 0, SEEK_END);
     lseek(fd, 0, SEEK_SET);
@@ -154,14 +154,14 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
         mmap_layer((struct Transformer *)config, i);
     }
 
-    fd = open("qwen_weights/norm.bin", O_RDONLY);
+    fd = open("weights/norm.bin", O_RDONLY);
     assert(fd > -1);
     file_size = lseek(fd, 0, SEEK_END);
     lseek(fd, 0, SEEK_SET);
     mmapping->final_layernorm = (__bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
 
-    fd = open("qwen_weights/lm_head.bin", O_RDONLY);
+    fd = open("weights/lm_head.bin", O_RDONLY);
     if (fd != -1) {
         file_size = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
@@ -173,7 +173,7 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
 void config_init(struct Config *config) {
 
     char path[FILENAME_MAX];
-    snprintf(path, FILENAME_MAX, "qwen_weights/config.bin");
+    snprintf(path, FILENAME_MAX, "weights/config.bin");
 
     FILE *f = fopen(path, "rb");
     assert(f != NULL);
@@ -445,7 +445,7 @@ void silu_array(__bf16 *output, const __bf16 *input, size_t n) {
 void token_init(struct Transformer *xfmr, const char *tokenizer_path) {
 
     char path[FILENAME_MAX];
-    snprintf(path, FILENAME_MAX, "qwen_weights/tokenizer.bin");
+    snprintf(path, FILENAME_MAX, "weights/tokenizer.bin");
 
     FILE *f = fopen(path, "rb");
     assert(f != NULL);
