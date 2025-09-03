@@ -116,9 +116,9 @@ void mmap_layer(struct Transformer *x, int layer) {
         {"weights/layer_%d_q_proj_w.bin", &l->q_proj_w},
         {"weights/layer_%d_k_proj_w.bin", &l->k_proj_w},
         {"weights/layer_%d_v_proj_w.bin", &l->v_proj_w},
-        {"weights/layer_%d_q_proj_b.bin", &l->q_proj_b},
-        {"weights/layer_%d_k_proj_b.bin", &l->k_proj_b},
-        {"weights/layer_%d_v_proj_b.bin", &l->v_proj_b},
+        // {"weights/layer_%d_q_proj_b.bin", &l->q_proj_b},
+        // {"weights/layer_%d_k_proj_b.bin", &l->k_proj_b},
+        // {"weights/layer_%d_v_proj_b.bin", &l->v_proj_b},
         {"weights/layer_%d_o_proj_w.bin", &l->o_proj_w},
         {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
         {"weights/layer_%d_mlp_down_proj.bin", &l->mlp_down_proj},
@@ -493,7 +493,7 @@ int main() {
 
     int stop_tokens[3] = {151645, 151644, 151643};
 
-#if 1
+#if 0
     int *tokens = calloc(c->max_position_embeddings, sizeof(__bf16));
     // Read tokens from stdin
     char input_buffer[4096];

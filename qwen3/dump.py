@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+import shutil
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -58,12 +59,11 @@ def main():
 
     # Ensure output folder is fresh
     if os.path.exists("weights"):
-        import shutil
-
         shutil.rmtree("weights")
+
     os.makedirs("weights", exist_ok=True)
 
-    model_name = os.environ.get("QWEN_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
+    model_name = os.environ.get("QWEN_MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
 
     # Select model class based on model name
     model = AutoModelForCausalLM.from_pretrained(
@@ -116,26 +116,25 @@ def main():
         with open(f"weights/layer_{i}_q_proj_w.bin", "wb") as f:
             q = attn.q_proj.weight.detach().cpu().view(torch.int16).numpy()
             q.tofile(f)
-        with open(f"weights/layer_{i}_q_proj_b.bin", "wb") as f:
-            q = attn.q_proj.bias.detach().cpu().view(torch.int16).numpy()
-            q.tofile(f)
+        # with open(f"weights/layer_{i}_q_proj_b.bin", "wb") as f:
+        #     q = attn.q_proj.bias.detach().cpu().view(torch.int16).numpy()
+        #     q.tofile(f)
         with open(f"weights/layer_{i}_k_proj_w.bin", "wb") as f:
             k = attn.k_proj.weight.detach().cpu().view(torch.int16).numpy()
             k.tofile(f)
-        with open(f"weights/layer_{i}_k_proj_b.bin", "wb") as f:
-            k = attn.k_proj.bias.detach().cpu().view(torch.int16).numpy()
-            k.tofile(f)
+        # with open(f"weights/layer_{i}_k_proj_b.bin", "wb") as f:
+        #     k = attn.k_proj.bias.detach().cpu().view(torch.int16).numpy()
+        #     k.tofile(f)
         with open(f"weights/layer_{i}_v_proj_w.bin", "wb") as f:
             v = attn.v_proj.weight.detach().cpu().view(torch.int16).numpy()
             v.tofile(f)
-        with open(f"weights/layer_{i}_v_proj_b.bin", "wb") as f:
-            v = attn.v_proj.bias.detach().cpu().view(torch.int16).numpy()
-            v.tofile(f)
+        # with open(f"weights/layer_{i}_v_proj_b.bin", "wb") as f:
+        #     v = attn.v_proj.bias.detach().cpu().view(torch.int16).numpy()
+        #     v.tofile(f)
         with open(f"weights/layer_{i}_o_proj_w.bin", "wb") as f:
             o = attn.o_proj.weight.detach().cpu().view(torch.int16).numpy()
             o.tofile(f)
 
-    # TODO: dump model.lm_head if exist
     if hasattr(model, "lm_head"):
         lm_head_weight = model.lm_head.weight.detach().cpu().view(torch.int16).numpy()
         with open("weights/lm_head.bin", "wb") as f:
