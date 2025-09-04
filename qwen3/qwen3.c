@@ -332,16 +332,16 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
     /* output projection */
     const __bf16 *ow = m->layers[layer].o_proj_w;
 
-    int sz = p->hidden_size / p->n_heads * p->kv_heads;
+    int sz = 4096 / p->n_heads * p->kv_heads;
 
     /* attention weight and bias */
-    matmul_bias(r->q, x, qw, NULL, p->hidden_size, p->hidden_size);
+    matmul_bias(r->q, x, qw, NULL, p->hidden_size, 4096);
     matmul_bias(r->k, x, kw, NULL, p->hidden_size, sz);
     matmul_bias(r->v, x, vw, NULL, p->hidden_size, sz);
 
     /* TODO: apply normalization */
 
-    for (int i = 0; i < p->hidden_size; i += 128) {
+    for (int i = 0; i < 4096; i += 128) {
         norm(r->q + i, r->q + i, m->layers[layer].q_norm, 128, xfmr);
     }
 
@@ -354,7 +354,7 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
 
     /* insert to kv cache */
     int n_heads = p->n_heads, kv_heads = p->kv_heads;
-    int hs = p->hidden_size / p->n_heads;
+    int hs = 4096 / p->n_heads;
     int index = n_heads / kv_heads;
     for (size_t h = 0; h < kv_heads; h++) {
         memcpy(r->layers[layer].key[h].cache + pos * hs, r->k + h * hs, hs * sizeof(__bf16));
@@ -364,7 +364,7 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
     /* Calculate attention score */
     __bf16 att[pos + 1] = {};
     __bf16 *y = xout;
-    memset(y, 0, p->hidden_size * sizeof(__bf16)); // clear output buffer
+    memset(y, 0, 4096 * sizeof(__bf16)); // clear output buffer
     for (int h = 0; h < p->n_heads; h++) {
 
         /* current token query at head h */
@@ -412,8 +412,8 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
         }
     }
 
-    memcpy(x, y, p->hidden_size * sizeof(__bf16));
-    matmul(y, x, ow, p->hidden_size, p->hidden_size);
+    memcpy(x, y, 4096 * sizeof(__bf16));
+    matmul(y, x, ow, 4096, p->hidden_size);
 }
 
 void *aligned_malloc(size_t alignment, size_t size) {
@@ -446,10 +446,10 @@ void runtime_init(struct Transformer *xfmr) {
     const struct Config *c = &xfmr->config;
     struct Runtime *r = &xfmr->runtime;
 
-    int head_dim = c->hidden_size / c->n_heads;
+    int head_dim = 128; /* TODO: */
     int sz = head_dim * c->kv_heads;
 
-    r->q = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * c->hidden_size);
+    r->q = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 4096);
     r->k = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * sz);
     r->v = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * sz);
 
@@ -517,10 +517,10 @@ int main() {
     runtime_init(x);
     token_init(x, 0);
 
-    __bf16 *skip = aligned_malloc(64, sizeof(__bf16) * c->hidden_size);
-    __bf16 *embeddings = aligned_malloc(64, sizeof(__bf16) * c->hidden_size);
-    __bf16 *embeddings2 = aligned_malloc(64, sizeof(__bf16) * c->hidden_size);
-    __bf16 *embeddings3 = aligned_malloc(64, sizeof(__bf16) * c->hidden_size);
+    __bf16 *skip = aligned_malloc(64, sizeof(__bf16) * 4096);
+    __bf16 *embeddings = aligned_malloc(64, sizeof(__bf16) * 4096);
+    __bf16 *embeddings2 = aligned_malloc(64, sizeof(__bf16) * 4096);
+    __bf16 *embeddings3 = aligned_malloc(64, sizeof(__bf16) * 4096);
 
     __bf16 *mlp_embeddings2 = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
     __bf16 *mlp_embeddings3 = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
