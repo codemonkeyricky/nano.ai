@@ -225,6 +225,31 @@ void layernorm(__bf16 *out, const __bf16 *in, const __bf16 *weight, struct Trans
     }
 }
 
+void norm(__bf16 *out, const __bf16 *in, const __bf16 *weight, const int len, struct Transformer *x) {
+
+    struct Config *c = &x->config;
+    struct Mmapping *m = &x->mmapping;
+
+    float mean = 0.0f;
+    for (int i = 0; i < len; i++) {
+        mean += (float)in[i];
+    }
+    mean /= (float)len;
+
+    float variance = 0.0f;
+    for (int i = 0; i < len; i++) {
+        float diff = (float)in[i] - mean;
+        variance += diff * diff;
+    }
+    variance /= (float)len;
+
+    float denom = 1.0f / sqrtf(variance + 1e-6f);
+
+    for (int i = 0; i < len; i++) {
+        out[i] = ((__bf16)((float)in[i] * denom)) * (float)weight[i];
+    }
+}
+
 void matmul_bias(__bf16 *__restrict out, const __bf16 *__restrict x, const __bf16 *__restrict w,
                  const __bf16 *__restrict b, int n, int d) {
     out = __builtin_assume_aligned(out, 64);
@@ -315,6 +340,14 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
     matmul_bias(r->v, x, vw, NULL, p->hidden_size, sz);
 
     /* TODO: apply normalization */
+
+    for (int i = 0; i < p->hidden_size; i += 128) {
+        norm(r->q + i, r->q + i, m->layers[layer].q_norm, 128, xfmr);
+    }
+
+    for (int i = 0; i < sz; i += 128) {
+        norm(r->k + i, r->k + i, m->layers[layer].k_norm, 128, xfmr);
+    }
 
     rotary_positional_embedding(r->q, cos, sin, xfmr, p->n_heads);
     rotary_positional_embedding(r->k, cos, sin, xfmr, p->kv_heads);
