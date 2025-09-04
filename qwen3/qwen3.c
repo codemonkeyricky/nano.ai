@@ -36,11 +36,13 @@ struct Layer {
     const __bf16 *input_layernorm;
     const __bf16 *post_attn_layernorm;
     const __bf16 *q_proj_w;
-    const __bf16 *q_proj_b;
+    const __bf16 *q_norm;
+    // const __bf16 *q_proj_b;
     const __bf16 *k_proj_w;
-    const __bf16 *k_proj_b;
+    const __bf16 *k_norm;
+    // const __bf16 *k_proj_b;
     const __bf16 *v_proj_w;
-    const __bf16 *v_proj_b;
+    // const __bf16 *v_proj_b;
     const __bf16 *o_proj_w;
     const __bf16 *mlp_gate_proj;
     const __bf16 *mlp_up_proj;
@@ -114,7 +116,9 @@ void mmap_layer(struct Transformer *x, int layer) {
     struct mmap_lookup lookup[] = {
         {"weights/layer_%d_input_layernorm.bin", &l->input_layernorm},
         {"weights/layer_%d_q_proj_w.bin", &l->q_proj_w},
+        {"weights/layer_%d_q_norm.bin", &l->q_norm},
         {"weights/layer_%d_k_proj_w.bin", &l->k_proj_w},
+        {"weights/layer_%d_k_norm.bin", &l->k_norm},
         {"weights/layer_%d_v_proj_w.bin", &l->v_proj_w},
         // {"weights/layer_%d_q_proj_b.bin", &l->q_proj_b},
         // {"weights/layer_%d_k_proj_b.bin", &l->k_proj_b},
@@ -297,11 +301,8 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
 
     /* q/k/v weight and bias */
     const __bf16 *qw = m->layers[layer].q_proj_w;
-    const __bf16 *qb = m->layers[layer].q_proj_b;
     const __bf16 *kw = m->layers[layer].k_proj_w;
-    const __bf16 *kb = m->layers[layer].k_proj_b;
     const __bf16 *vw = m->layers[layer].v_proj_w;
-    const __bf16 *vb = m->layers[layer].v_proj_b;
 
     /* output projection */
     const __bf16 *ow = m->layers[layer].o_proj_w;
@@ -309,9 +310,11 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
     int sz = p->hidden_size / p->n_heads * p->kv_heads;
 
     /* attention weight and bias */
-    matmul_bias(r->q, x, qw, qb, p->hidden_size, p->hidden_size);
-    matmul_bias(r->k, x, kw, kb, p->hidden_size, sz);
-    matmul_bias(r->v, x, vw, vb, p->hidden_size, sz);
+    matmul_bias(r->q, x, qw, NULL, p->hidden_size, p->hidden_size);
+    matmul_bias(r->k, x, kw, NULL, p->hidden_size, sz);
+    matmul_bias(r->v, x, vw, NULL, p->hidden_size, sz);
+
+    /* TODO: apply normalization */
 
     rotary_positional_embedding(r->q, cos, sin, xfmr, p->n_heads);
     rotary_positional_embedding(r->k, cos, sin, xfmr, p->kv_heads);
@@ -427,7 +430,6 @@ void runtime_init(struct Transformer *xfmr) {
         r->layers[i].key = (Head *)calloc(sizeof(Head), c->kv_heads);
         r->layers[i].value = (Head *)calloc(sizeof(Head), c->kv_heads);
         for (size_t j = 0; j < c->kv_heads; ++j) {
-            /* TODO: parameterized 2 and 128, relating to group heads  */
             r->layers[i].key[j].cache =
                 (__bf16 *)aligned_malloc(64, sizeof(__bf16) * c->max_position_embeddings * head_dim);
             r->layers[i].value[j].cache =

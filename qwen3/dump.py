@@ -116,11 +116,17 @@ def main():
         with open(f"weights/layer_{i}_q_proj_w.bin", "wb") as f:
             q = attn.q_proj.weight.detach().cpu().view(torch.int16).numpy()
             q.tofile(f)
+        with open(f"weights/layer_{i}_q_norm.bin", "wb") as f:
+            q = attn.q_norm.weight.detach().cpu().view(torch.int16).numpy()
+            q.tofile(f)
         # with open(f"weights/layer_{i}_q_proj_b.bin", "wb") as f:
         #     q = attn.q_proj.bias.detach().cpu().view(torch.int16).numpy()
         #     q.tofile(f)
         with open(f"weights/layer_{i}_k_proj_w.bin", "wb") as f:
             k = attn.k_proj.weight.detach().cpu().view(torch.int16).numpy()
+            k.tofile(f)
+        with open(f"weights/layer_{i}_k_norm.bin", "wb") as f:
+            k = attn.k_norm.weight.detach().cpu().view(torch.int16).numpy()
             k.tofile(f)
         # with open(f"weights/layer_{i}_k_proj_b.bin", "wb") as f:
         #     k = attn.k_proj.bias.detach().cpu().view(torch.int16).numpy()
