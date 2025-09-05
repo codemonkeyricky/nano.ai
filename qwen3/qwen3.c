@@ -84,8 +84,8 @@ struct Transformer {
 
 void rope_init(struct Config *c) {
 
-    const float t = 1000000.0;
-    const int d = c->hidden_size / c->n_heads;
+    const float t = 5000000.0;
+    const int d = 128; // c->hidden_size / c->n_heads;
 
     // Calculate inverse frequencies
     for (int i = 0; i < d / 2; i++) {
@@ -96,7 +96,7 @@ void rope_init(struct Config *c) {
 }
 
 void rope_forward(struct Config *c, struct RotaryPosEmb *rope, int p, __bf16 *cos, __bf16 *sin) {
-    const int d = c->hidden_size / c->n_heads;
+    const int d = 128; 
     for (int f = 0; f < d / 2; f++) {
         float freq = (float)p * rope->inv_freq[f];
         cos[f] = cos[d / 2 + f] = cosf(freq);
@@ -195,7 +195,7 @@ void config_init(struct Config *config) {
     config->max_position_embeddings = vals[4];
     config->intermediate_size = vals[6];
 
-    config->d.rope.inv_freq = (float *)malloc(sizeof(float) * (config->hidden_size / config->n_heads) / 2);
+    config->d.rope.inv_freq = (float *)malloc(sizeof(float) * (128) / 2);
 
     rope_init(config);
 }
@@ -297,7 +297,7 @@ void rotate_half(__bf16 *out, const __bf16 *x, int D) {
 void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const struct Transformer *x, int heads) {
 
     __bf16 *in = emb, *out = x->runtime.h1, *out2 = x->runtime.h2, *out3 = x->runtime.h3;
-    int n = x->config.hidden_size / x->config.n_heads;
+    int n = 128; // x->config.hidden_size / x->config.n_heads;
 
     /* Apply rotary positional embedding for all heads */
     for (int h = 0; h < heads; h++) {
@@ -545,7 +545,7 @@ int main() {
     int tokens[4096] = {151644, 872, 198, 285, 625, 1535, 264, 11580, 151645, 198, 151644, 77091, 198};
 #endif
 
-    int head_dim = c->hidden_size / c->n_heads;
+    int head_dim = 128; // c->hidden_size / c->n_heads;
     __bf16 cos[head_dim] = {}, sin[head_dim] = {};
 
     clock_t start_time = clock(); // Start timing
