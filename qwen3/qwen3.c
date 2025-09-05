@@ -528,7 +528,7 @@ int main() {
 
     int stop_tokens[3] = {151645, 151644, 151643};
 
-#if 0
+#if 1
     int *tokens = calloc(c->max_position_embeddings, sizeof(__bf16));
     // Read tokens from stdin
     char input_buffer[4096];
