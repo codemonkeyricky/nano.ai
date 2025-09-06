@@ -37,7 +37,7 @@ def dump_config_bin(config, filename):
 
 def main():
     # Possible models: gpt2, gpt2-medium, gpt2-large, gpt2-xl
-    model_name = "gpt2"  # gpt2-small
+    model_name = "gpt2-xl"  # gpt2-small
     out_dir = "./gpt2_weights"
     os.makedirs(out_dir, exist_ok=True)
     model = GPT2LMHeadModel.from_pretrained(model_name)

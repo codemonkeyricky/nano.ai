@@ -258,6 +258,7 @@ void matmul_bias(__bf16 *__restrict out, const __bf16 *__restrict x, const __bf1
     assert(n % 32 == 0);
     assert(d % 32 == 0);
     int i;
+    #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
         __m512 acc = _mm512_setzero_ps();
         for (int j = 0; j < n; j += 32) {
