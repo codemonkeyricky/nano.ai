@@ -1,0 +1,22 @@
+https://www.linkedin.com/feed/update/urn:li:activity:7368490773480210432/
+https://www.linkedin.com/feed/update/urn:li:activity:7367026411712262144/
+
+# Build
+make
+
+# Create python virtual environment 
+python3 -m venv venv
+source venv/bin/activate
+
+# Select model:
+# eg. Qwen/Qwen2.5-0.5B
+# Qwen2.5 offers 0.5B, 1.5B, 3B, 7b, ... etc
+# See https://huggingface.co/collections/Qwen/qwen25-66e81a666513e518adb90d9e
+export QWEN_MODEL_NAME="Qwen/Qwen3-4B-Instruct-2507"
+
+# dump weights
+python3 dump.py
+
+# inference
+echo "How hot is the sun?" | python3 tokenizer.py | ./qwen
+

@@ -563,6 +563,9 @@ int main() {
     probs = malloc(top_k * sizeof(float));
 
     float *logits = malloc(vocab_size * sizeof(float));
+
+    clock_t start_time = clock(); // Start timing
+
     while (k < 100) {
         generate(logits, token, k++);
 
@@ -579,5 +582,13 @@ int main() {
     deinit();
 
     token_deinit();
+
+    clock_t end_time = clock(); // End timing
+    double elapsed_sec = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+    double tokens_per_sec = (double)k / elapsed_sec;
+    printf("\nTokens processed: %d\n", k);
+    printf("Elapsed time: %.3f seconds\n", elapsed_sec);
+    printf("Tokens per second: %.2f\n", tokens_per_sec);
+
     return 0;
 }
