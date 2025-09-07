@@ -37,12 +37,9 @@ struct Layer {
     const __bf16 *post_attn_layernorm;
     const __bf16 *q_proj_w;
     const __bf16 *q_norm;
-    // const __bf16 *q_proj_b;
     const __bf16 *k_proj_w;
     const __bf16 *k_norm;
-    // const __bf16 *k_proj_b;
     const __bf16 *v_proj_w;
-    // const __bf16 *v_proj_b;
     const __bf16 *o_proj_w;
     const __bf16 *mlp_gate_proj;
     const __bf16 *mlp_up_proj;
@@ -367,11 +364,14 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
     int index = n_heads / kv_heads;
     for (size_t h = 0; h < kv_heads; h++) {
         memcpy(r->layers[layer].key[h].cache + pos * hs, r->k + h * hs, hs * sizeof(__bf16));
-        memcpy(r->layers[layer].value[h].cache + pos * hs, r->v + h * hs, hs * sizeof(__bf16));
+        /* value is transposed to simply dot product with query */
+        for (size_t k = 0; k < hs; ++k) {
+            *(r->layers[layer].value[h].cache + p->max_position_embeddings * k + pos) = r->v[h * hs + k];
+        }
     }
 
     /* Calculate attention score */
-    __bf16 att[pos + 1] = {};
+    __bf16 att[(pos + 1 + 31) / 32 * 32] = {};
     __bf16 *y = xout;
     memset(y, 0, attn_sz * sizeof(__bf16)); // clear output buffer
     for (int h = 0; h < p->n_heads; h++) {
@@ -408,10 +408,8 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
         for (int i = 0; i < hs; i++) {
             __bf16 *vv = r->layers[layer].value[h / index].cache;
             __bf16 *yy = y + h * hs; // (1, hs)
-            for (int t = 0; t <= pos; t++) {
-                /* find v for the current head */
-                yy[i] += att[t] * vv[t * hs + i];
-            }
+            /* find v for the current head */
+            yy[i] += dot(att, &vv[i * p->max_position_embeddings], (pos + 1 + 31) / 32 * 32);
         }
     }
 
