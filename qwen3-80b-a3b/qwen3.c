@@ -45,12 +45,17 @@ struct Layer {
     const __bf16 *gate;
     const __bf16 *input_layernorm;
     const __bf16 *post_attn_layernorm;
+    /* self attention */
     const __bf16 *q_proj_w;
     const __bf16 *q_norm;
     const __bf16 *k_proj_w;
     const __bf16 *k_norm;
     const __bf16 *v_proj_w;
     const __bf16 *o_proj_w;
+    /* linear attention */
+    const __bf16 *linear_attn_in_proj_ba_w;
+    const __bf16 *linear_attn_in_proj_qkvz_w;
+    const __bf16 *linear_attn_out_proj_w;
     struct Expert *experts;
 };
 
@@ -156,14 +161,18 @@ void mmap_layer(struct Transformer *x, int layer) {
     };
 
     struct mmap_lookup lookup[] = {
-        {"weights/layer_%d_mlp_gate.bin", &l->gate}, {"weights/layer_%d_input_layernorm.bin", &l->input_layernorm},
-        // {"weights/layer_%d_q_proj_w.bin", &l->q_proj_w},
-        // {"weights/layer_%d_q_norm.bin", &l->q_norm},
-        // {"weights/layer_%d_k_proj_w.bin", &l->k_proj_w},
-        // {"weights/layer_%d_k_norm.bin", &l->k_norm},
-        // {"weights/layer_%d_v_proj_w.bin", &l->v_proj_w},
-        // {"weights/layer_%d_o_proj_w.bin", &l->o_proj_w},
-        // {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
+        {"weights/layer_%d_mlp_gate.bin", &l->gate},
+        {"weights/layer_%d_input_layernorm.bin", &l->input_layernorm},
+        {"weights/layer_%d_self_attn_q_proj_w.bin", &l->q_proj_w},
+        {"weights/layer_%d_self_attn_q_norm.bin", &l->q_norm},
+        {"weights/layer_%d_self_attn_k_proj_w.bin", &l->k_proj_w},
+        {"weights/layer_%d_self_attn_k_norm.bin", &l->k_norm},
+        {"weights/layer_%d_self_attn_v_proj_w.bin", &l->v_proj_w},
+        {"weights/layer_%d_self_attn_o_proj_w.bin", &l->o_proj_w},
+        {"weights/layer_%d_linear_attn_in_proj_qkvz_w.bin", &l->linear_attn_in_proj_qkvz_w},
+        {"weights/layer_%d_linear_attn_in_proj_ba_w.bin", &l->linear_attn_in_proj_ba_w},
+        {"weights/layer_%d_linear_attn_out_proj_w.bin", &l->linear_attn_out_proj_w},
+        {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
     };
 
     for (ssize_t i = 0; i < sizeof(lookup) / sizeof(lookup[0]); i++) {
@@ -172,11 +181,13 @@ void mmap_layer(struct Transformer *x, int layer) {
         snprintf(path, FILENAME_MAX, lookup[i].path, layer);
 
         int fd = open(path, O_RDONLY);
-        assert(fd > -1);
-        int file_size = lseek(fd, 0, SEEK_END);
-        lseek(fd, 0, SEEK_SET);
-        *lookup[i].mmap = (const __bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
+        if (fd > -1) {
+            /* self and linear attention are mutually exclusive */
+            int file_size = lseek(fd, 0, SEEK_END);
+            lseek(fd, 0, SEEK_SET);
+            *lookup[i].mmap = (const __bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+        }
     }
 }
 
@@ -188,7 +199,7 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
     mmapping->embeddings = (__bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
 
-    mmapping->layers = (struct Layer *)malloc(sizeof(struct Layer) * config->n_layers);
+    mmapping->layers = (struct Layer *)calloc(1, sizeof(struct Layer) * config->n_layers);
 
     for (int i = 0; i < config->n_layers; i++) {
         mmap_layer((struct Transformer *)config, i);
