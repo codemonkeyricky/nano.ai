@@ -496,6 +496,9 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
     matmul(y, x, ow, attn_sz, p->hidden_size);
 }
 
+void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
+                      const int pos, __bf16 *sin, __bf16 *cos) {}
+
 void *aligned_malloc(size_t alignment, size_t size) {
 
     if ((alignment & (alignment - 1)) != 0) {
@@ -679,7 +682,11 @@ int main() {
             memcpy(skip, embeddings, c->hidden_size * sizeof(__bf16));
 
             layernorm(embeddings2, embeddings, m->layers[k].input_layernorm, x);
-            self_attention(embeddings, embeddings2, x, k, pos, sin, cos);
+            if (m->layers[k].q_proj_w) {
+                self_attention(embeddings, embeddings2, x, k, pos, sin, cos);
+            } else {
+                linear_attention(embeddings, embeddings2, x, k, pos, sin, cos);
+            }
 
             /* residual */
             add(embeddings2, embeddings, skip, c->hidden_size);
