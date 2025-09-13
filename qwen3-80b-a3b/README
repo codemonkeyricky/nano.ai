@@ -1,0 +1,101 @@
+# Transformer Model Implementation
+
+This repository contains a C implementation of a transformer model, optimized for performance using AVX-512 instructions and bfloat16 data types. The implementation includes support for rotary positional embeddings, multi-head attention with key-value caching, and mixture of experts (MoE) layers.
+
+## Table of Contents
+1. [Architecture](#architecture)
+2. [Components](#components)
+3. [Functions](#functions)
+4. [Usage](#usage)
+5. [Dependencies](#dependencies)
+6. [Performance Considerations](#performance-considerations)
+7. [License](#license)
+8. [Contributing](#contributing)
+9. [Contact](#contact)
+
+## Architecture
+
+The transformer model is implemented using a modular architecture with the following key components:
+
+- **Configuration**: Stores model hyperparameters such as vocabulary size, hidden size, number of heads, etc.
+- **Memory Mapping**: Handles loading model weights from binary files using memory mapping.
+- **Runtime**: Manages temporary buffers and caches used during inference.
+- **Layers**: Represents individual transformer layers, including attention and feed-forward components.
+- **Experts**: Implements mixture of experts (MoE) functionality.
+
+## Components
+
+### Data Structures
+
+- `structConfig`: Configuration parameters for the transformer model.
+- `structMmapping`: Memory mapping structure for loading weights.
+- `structRuntime`: Runtime buffers and caches.
+- `structLayer`: Individual transformer layer components.
+- `structExpert`: Expert layer components for MoE.
+- `structTransformer`: Main structure combining all components.
+
+### Key Functions
+
+- `rope_init()`: Initializes rotary positional embeddings.
+- `rope_forward()`: Applies rotary positional embeddings to input tensors.
+- `mmap_layer_expert()`: Maps expert layer weights from files.
+- `mmap_layer()`: Maps layer weights from files.
+- `mmap_init()`: Initializes memory mapping for all model weights.
+- `config_init()`: Initializes configuration from binary file.
+- `layernorm()`: Applies layer normalization.
+- `norm()`: Generic normalization function.
+- `dot()`: Computes dot product using AVX-512 instructions.
+- `matmul_bias()`: Performs matrix multiplication with bias.
+- `matmul()`: Performs matrix multiplication.
+- `mul()`: Element-wise multiplication.
+- `add()`: Element-wise addition.
+- `rotate_half()`: Rotates half of the tensor.
+- `rotary_positional_embedding()`: Applies rotary positional embedding.
+- `self_attention()`: Implements self-attention mechanism.
+
+## Usage
+
+### Building
+
+To build the code, you will need a C compiler that supports AVX-512 instructions (e.g., GCC 9+ or Clang 10+). Compile with:
+
+```bash
+gcc -O3 -mavx512f -mavx512dq -mavx512bw -mavx512vl -fopenmp -o transformer transformer.c
+```
+
+### Running
+
+The model expects the following directory structure:
+```
+weights/
+├── config.bin
+├── embeddings.bin
+├── norm.bin
+├── lm_head.bin
+└── layer_*/  # Each layer directory contains weight files
+```
+
+Run the compiled program:
+```bash
+./transformer
+```
+
+## Dependencies
+
+- C compiler with AVX-512 support (GCC 9+, Clang 10+)
+- OpenMP (for parallelization)
+- Standard C library
+- Linux system (for `mmap` and `open` system calls)
+
+## Performance Considerations
+
+- **AVX-512 Optimization**: The code uses AVX-512 instructions for efficient computation of dot products and matrix operations.
+- **Memory Mapping**: Weights are loaded using memory mapping for efficient access.
+- **Bfloat16 Precision**: Uses bfloat16 data type for reduced memory usage and faster computation.
+- **Key-Value Caching**: Implements key-value caching for efficient attention computation during generation.
+- **Parallelization**: Uses OpenMP for parallelizing matrix operations.
+
+## Contributing
+
+Contributions are welcome! Please fork the repository and submit a pull request with your changes.
+
