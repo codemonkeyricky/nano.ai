@@ -87,8 +87,15 @@ struct Transformer {
     struct Runtime runtime;
 };
 
+void mul(__bf16 *out, const __bf16 *a, const __bf16 *b, int n) {
+    for (int i = 0; i < n; i++) {
+        out[i] = (__bf16)((float)a[i] * (float)b[i]);
+    }
+}
+
 void rope_init(struct Config *c) {
 
+#if 0
     const float t = 5000000.0;
     const int d = c->head_dim; // c->hidden_size / c->n_heads;
 
@@ -98,14 +105,15 @@ void rope_init(struct Config *c) {
         float exponent = r / (float)d;
         c->d.rope.inv_freq[i] = 1.0f / powf(t, exponent);
     }
+#endif
 }
 
 void rope_forward(struct Config *c, struct RotaryPosEmb *rope, int p, __bf16 *cos, __bf16 *sin) {
     const int d = c->head_dim;
-    for (int f = 0; f < d / 2; f++) {
-        float freq = (float)p * rope->inv_freq[f];
-        cos[f] = cos[d / 2 + f] = cosf(freq);
-        sin[f] = sin[d / 2 + f] = sinf(freq);
+    for (int f = 0; f < 32; f++) {
+        float freq = (float)p * rope->inv_freq[f % 32];
+        cos[f] = cos[32 + f] = cosf(freq);
+        sin[f] = sin[32 + f] = sinf(freq);
     }
 }
 
@@ -148,15 +156,14 @@ void mmap_layer(struct Transformer *x, int layer) {
     };
 
     struct mmap_lookup lookup[] = {
-        {"weights/layer_%d_mlp_gate.bin", &l->gate},
-        {"weights/layer_%d_input_layernorm.bin", &l->input_layernorm},
-        {"weights/layer_%d_q_proj_w.bin", &l->q_proj_w},
-        {"weights/layer_%d_q_norm.bin", &l->q_norm},
-        {"weights/layer_%d_k_proj_w.bin", &l->k_proj_w},
-        {"weights/layer_%d_k_norm.bin", &l->k_norm},
-        {"weights/layer_%d_v_proj_w.bin", &l->v_proj_w},
-        {"weights/layer_%d_o_proj_w.bin", &l->o_proj_w},
-        {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
+        {"weights/layer_%d_mlp_gate.bin", &l->gate}, {"weights/layer_%d_input_layernorm.bin", &l->input_layernorm},
+        // {"weights/layer_%d_q_proj_w.bin", &l->q_proj_w},
+        // {"weights/layer_%d_q_norm.bin", &l->q_norm},
+        // {"weights/layer_%d_k_proj_w.bin", &l->k_proj_w},
+        // {"weights/layer_%d_k_norm.bin", &l->k_norm},
+        // {"weights/layer_%d_v_proj_w.bin", &l->v_proj_w},
+        // {"weights/layer_%d_o_proj_w.bin", &l->o_proj_w},
+        // {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
     };
 
     for (ssize_t i = 0; i < sizeof(lookup) / sizeof(lookup[0]); i++) {
@@ -186,12 +193,15 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
     for (int i = 0; i < config->n_layers; i++) {
         mmap_layer((struct Transformer *)config, i);
 
+#if 0
         mmapping->layers[i].experts = (struct Expert *)malloc(sizeof(struct Expert) * 128);
         for (auto int ex = 0; ex < 128; ++ex) {
             mmap_layer_expert((struct Transformer *)config, i, ex);
         }
+#endif
     }
 
+#if 0
     fd = open("weights/norm.bin", O_RDONLY);
     assert(fd > -1);
     file_size = lseek(fd, 0, SEEK_END);
@@ -206,7 +216,14 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
         mmapping->lm_head = (__bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
     }
+#endif
 }
+
+static float tensor_array[] = {
+    1.0000e+00f, 6.0430e-01f, 3.6517e-01f, 2.2067e-01f, 1.3335e-01f, 8.0584e-02f, 4.8697e-02f, 2.9427e-02f,
+    1.7783e-02f, 1.0746e-02f, 6.4938e-03f, 3.9242e-03f, 2.3714e-03f, 1.4330e-03f, 8.6596e-04f, 5.2330e-04f,
+    3.1623e-04f, 1.9110e-04f, 1.1548e-04f, 6.9783e-05f, 4.2170e-05f, 2.5483e-05f, 1.5399e-05f, 9.3057e-06f,
+    5.6234e-06f, 3.3982e-06f, 2.0535e-06f, 1.2409e-06f, 7.4989e-07f, 4.5316e-07f, 2.7384e-07f, 1.6548e-07f};
 
 void config_init(struct Config *config) {
 
@@ -233,7 +250,8 @@ void config_init(struct Config *config) {
     config->num_experts_per_token = vals[9];
     config->moe_intermediate_size = vals[10];
 
-    config->d.rope.inv_freq = (float *)malloc(sizeof(float) * (config->head_dim) / 2);
+    // config->d.rope.inv_freq = (float *)malloc(sizeof(float) * (config->head_dim) / 2);
+    config->d.rope.inv_freq = tensor_array;
 
     rope_init(config);
 }
@@ -263,10 +281,42 @@ void norm(__bf16 *out, const __bf16 *in, const __bf16 *weight, const int len, st
     }
 }
 
+void rmsnorm_forward(__bf16 *out, __bf16 *in, int dim) {
+    const float eps = 1e-6f; // Small epsilon value to avoid division by zero
+
+    // Calculate sum of squares (convert to float for precision)
+    float sum_squares = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        float val = (float)in[i]; // Convert bf16 to float
+        sum_squares += val * val;
+    }
+
+    // Calculate mean of squares
+    float mean_squares = sum_squares / dim;
+
+    // Calculate reciprocal square root of (mean_squares + eps)
+    float rsqrt_val = 1.0f / sqrtf(mean_squares + eps);
+
+    // Apply normalization: out = in * rsqrt(mean(in^2) + eps)
+    for (int i = 0; i < dim; i++) {
+        float val = (float)in[i];           // Convert bf16 to float
+        out[i] = (__bf16)(val * rsqrt_val); // Convert back to bf16
+    }
+}
+
 void layernorm(__bf16 *out, const __bf16 *in, const __bf16 *weight, struct Transformer *x) {
 
     struct Config *c = &x->config;
-    norm(out, in, weight, c->hidden_size, x);
+    // norm(out, in, weight, c->hidden_size, x);
+
+    __bf16 tmp[c->hidden_size], tmp2[c->hidden_size];
+    rmsnorm_forward(tmp, in, c->hidden_size);
+
+    for (size_t i = 0; i < c->hidden_size; i++) {
+        tmp2[i] = weight[i] + 1.0f;
+    }
+
+    mul(out, tmp2, tmp, c->hidden_size);
 }
 
 __bf16 dot(__bf16 *__restrict x, __bf16 *__restrict w, int n) {
@@ -301,12 +351,6 @@ void matmul_bias(__bf16 *__restrict out, const __bf16 *__restrict x, const __bf1
 
 void matmul(__bf16 *__restrict out, const __bf16 *__restrict x, const __bf16 *__restrict w, int n, int d) {
     matmul_bias(out, x, w, 0, n, d);
-}
-
-void mul(__bf16 *out, const __bf16 *a, const __bf16 *b, int n) {
-    for (int i = 0; i < n; i++) {
-        out[i] = (__bf16)((float)a[i] * (float)b[i]);
-    }
 }
 
 void add(__bf16 *out, const __bf16 *a, const __bf16 *b, int n) {
@@ -590,7 +634,7 @@ int main() {
 
     int stop_tokens[3] = {151645, 151644, 151643};
 
-#if 1
+#if 0
     int *tokens = calloc(c->max_position_embeddings, sizeof(__bf16));
     // Read tokens from stdin
     char input_buffer[16384] = {};
@@ -607,7 +651,7 @@ int main() {
     int tokens[4096] = {151644, 872, 198, 285, 625, 1535, 264, 11580, 151645, 198, 151644, 77091, 198};
 #endif
 
-    __bf16 cos[c->head_dim] = {}, sin[c->head_dim] = {};
+    __bf16 cos[64] = {}, sin[64] = {};
 
     clock_t start_time = clock(); // Start timing
 
