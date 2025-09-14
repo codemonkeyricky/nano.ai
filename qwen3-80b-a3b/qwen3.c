@@ -83,7 +83,7 @@ struct Runtime {
     __bf16 *h1;
     __bf16 *h2;
     __bf16 *h3;
-    __bf16 *qkvz;
+    __bf16 *qkvz[4]; /* kernel_size */
     __bf16 *ba;
     struct RLayer *layers;
     char **lookup;
@@ -524,14 +524,57 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
     matmul(y, x, ow, attn_sz, p->hidden_size);
 }
 
+struct qkvz {
+    union {
+        __bf16 qkv[512]; /* 128 + 128 + 256*/
+        struct {
+            __bf16 q[128];
+            __bf16 k[128];
+            __bf16 v[256];
+        };
+    };
+    __bf16 z[256];
+};
+
+struct projected_qkvz {
+    struct qkvz head[16];
+};
+
 void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
                       const int pos, __bf16 *sin, __bf16 *cos) {
     const struct Config *c = &xfmr->config;
     const struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
+    int pp = pos % 4;
 
-    matmul(r->qkvz, x, m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
+    matmul(r->qkvz[pp], x, m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
     matmul(r->ba, x, m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
+
+    struct projected_qkvz *qkvz = (struct projected_qkvz *)r->qkvz[pp];
+
+    /* conv1d over qkv - 8192 dimensions */
+    for (int i = 0; i < 16; i++) {
+        for (int j = 0; j < 512; j++) {
+            __bf16 tmp = 0;
+            for (int k = 0; k < 4; ++k) {
+                struct projected_qkvz *proj = (struct projected_qkvz *)r->qkvz[(pp + 1 + k) % 4];
+                tmp += proj->head[i].qkv[j] * m->layers[layer].linear_attn_conv1d_w[i * 512 * 4 + j * 4 + k];
+            }
+            qkvz->head[i].qkv[j] = tmp;
+        }
+    }
+
+    /*
+    projected_states_qkvz contains interleaved Q, K, V, and Z.
+    It is split into query, key, value, and z (plus b, a) using fix_query_key_value_ordering.
+    query, key, and value are reshaped and concatenated into a single tensor (e.g., shape [batch, seq_len, 8192]).
+    This concatenated tensor is transposed and passed through a grouped conv1d, which mixes information from previous
+    tokens. The output is SiLU activated. The result is transposed back and split into query, key, and value again, then
+    reshaped into attention heads for further processing.
+
+
+
+*/
 
     /* TODO: split r->qkvz into 16 heads (16 x 768)*/
     /* TODO: split each head into qkvz (128+128+256+256) */
@@ -554,7 +597,7 @@ void *aligned_malloc(size_t alignment, size_t size) {
     if (alignment < sizeof(void *))
         alignment = sizeof(void *);
 
-    void *raw = malloc(size + alignment + sizeof(void *) - 1);
+    void *raw = calloc(1, size + alignment + sizeof(void *) - 1);
     if (!raw)
         return NULL;
     uintptr_t aligned = ((uintptr_t)raw + sizeof(void *) + alignment - 1) & ~(alignment - 1);
@@ -586,7 +629,9 @@ void runtime_init(struct Transformer *xfmr) {
     r->h2 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * sz);
     r->h3 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * sz);
 
-    r->qkvz = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 12288);
+    for (int i = 0; i < 4; ++i) {
+        r->qkvz[i] = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 12288);
+    }
     r->ba = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 64);
 
     r->layers = (struct RLayer *)calloc(sizeof(struct RLayer), c->n_layers);
