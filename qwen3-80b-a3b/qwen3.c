@@ -56,6 +56,7 @@ struct Layer {
     const __bf16 *linear_attn_in_proj_ba_w;
     const __bf16 *linear_attn_in_proj_qkvz_w;
     const __bf16 *linear_attn_out_proj_w;
+    const __bf16 *linear_attn_conv1d_w;
     struct Expert *experts;
 };
 
@@ -82,6 +83,8 @@ struct Runtime {
     __bf16 *h1;
     __bf16 *h2;
     __bf16 *h3;
+    __bf16 *qkvz;
+    __bf16 *ba;
     struct RLayer *layers;
     char **lookup;
 };
@@ -172,6 +175,7 @@ void mmap_layer(struct Transformer *x, int layer) {
         {"weights/layer_%d_linear_attn_in_proj_qkvz_w.bin", &l->linear_attn_in_proj_qkvz_w},
         {"weights/layer_%d_linear_attn_in_proj_ba_w.bin", &l->linear_attn_in_proj_ba_w},
         {"weights/layer_%d_linear_attn_out_proj_w.bin", &l->linear_attn_out_proj_w},
+        {"weights/layer_%d_linear_attn_conv1d_w.bin", &l->linear_attn_conv1d_w},
         {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
     };
 
@@ -354,9 +358,10 @@ void matmul_bias(__bf16 *__restrict out, const __bf16 *__restrict x, const __bf1
     assert(n % 32 == 0);
     assert(d % 32 == 0);
     int i;
-#pragma omp parallel for private(i)
+    // #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-        out[i] = dot(x, &w[i * n], n) + (b ? (float)b[i] : 0);
+        __bf16 tmp = dot(x, &w[i * n], n) + (b ? (float)b[i] : 0);
+        out[i] = tmp;
     }
 }
 
@@ -497,7 +502,25 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
 }
 
 void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
-                      const int pos, __bf16 *sin, __bf16 *cos) {}
+                      const int pos, __bf16 *sin, __bf16 *cos) {
+    const struct Config *c = &xfmr->config;
+    const struct Runtime *r = &xfmr->runtime;
+    const struct Mmapping *m = &xfmr->mmapping;
+
+    matmul(r->qkvz, x, m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
+    matmul(r->ba, x, m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
+
+    /* TODO: split r->qkvz into 16 heads (16 x 768)*/
+    /* TODO: split each head into qkvz (128+128+256+256) */
+
+    /*
+     * TODO:
+     * ba split to 16 heads ( 16 x 4 )
+     * split each head into b,a (2+2)
+     */
+
+    volatile int dummy = 0;
+}
 
 void *aligned_malloc(size_t alignment, size_t size) {
 
@@ -539,6 +562,9 @@ void runtime_init(struct Transformer *xfmr) {
     r->h1 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * sz);
     r->h2 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * sz);
     r->h3 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * sz);
+
+    r->qkvz = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 12288);
+    r->ba = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 64);
 
     r->layers = (struct RLayer *)calloc(sizeof(struct RLayer), c->n_layers);
 

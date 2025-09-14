@@ -60,10 +60,10 @@ def dump_tokenizer_bin(tokenizer, filename):
 def main():
 
     # Ensure output folder is fresh
-    if os.path.exists("weights"):
-        shutil.rmtree("weights")
+    # if os.path.exists("weights"):
+    #     shutil.rmtree("weights")
 
-    os.makedirs("weights", exist_ok=True)
+    # os.makedirs("weights", exist_ok=True)
 
     model_name = os.environ.get("QWEN_MODEL_NAME", "Qwen/Qwen3-Next-80B-A3B-Instruct")
 
@@ -116,6 +116,9 @@ def main():
                 w.tofile(f)
             with open(f"weights/layer_{i}_linear_attn_out_proj_w.bin", "wb") as f:
                 w = attn.out_proj.weight.detach().cpu().view(torch.int16).numpy()
+                w.tofile(f)
+            with open(f"weights/layer_{i}_linear_attn_conv1d_w.bin", "wb") as f:
+                w = attn.conv1d.weight.detach().cpu().view(torch.int16).numpy()
                 w.tofile(f)
 
         # self_attn weights and biases
