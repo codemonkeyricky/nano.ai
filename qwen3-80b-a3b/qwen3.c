@@ -319,6 +319,29 @@ void rmsnorm_forward(__bf16 *out, __bf16 *in, int dim) {
     }
 }
 
+void conv1d_simple(__bf16 *output, const __bf16 *input, const __bf16 *weight, int length, int stride, int padding) {
+
+    int kernel_size = 4;
+    int output_length = (length + 2 * padding - (kernel_size - 1) - 1) / stride + 1;
+
+    // Perform convolution - each filter processes its corresponding input channel
+    for (int ol = 0; ol < output_length; ol++) {
+        int input_start = ol * stride - padding;
+
+        for (int k = 0; k < kernel_size; k++) {
+            int input_pos = input_start + k;
+
+            if (input_pos >= 0 && input_pos < length) {
+                int input_idx = input_pos;
+                int weight_idx = k;
+                int output_idx = ol;
+
+                output[output_idx] += input[input_idx] * weight[weight_idx];
+            }
+        }
+    }
+}
+
 void layernorm(__bf16 *out, const __bf16 *in, const __bf16 *weight, struct Transformer *x) {
 
     struct Config *c = &x->config;
