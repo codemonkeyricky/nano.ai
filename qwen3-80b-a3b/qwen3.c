@@ -57,6 +57,8 @@ struct Layer {
     const __bf16 *linear_attn_in_proj_qkvz_w;
     const __bf16 *linear_attn_out_proj_w;
     const __bf16 *linear_attn_conv1d_w;
+    const __bf16 *linear_attn_dt_b;
+    const __bf16 *linear_attn_a_log;
     struct Expert *experts;
 };
 
@@ -176,6 +178,8 @@ void mmap_layer(struct Transformer *x, int layer) {
         {"weights/layer_%d_linear_attn_in_proj_ba_w.bin", &l->linear_attn_in_proj_ba_w},
         {"weights/layer_%d_linear_attn_out_proj_w.bin", &l->linear_attn_out_proj_w},
         {"weights/layer_%d_linear_attn_conv1d_w.bin", &l->linear_attn_conv1d_w},
+        {"weights/layer_%d_linear_attn_dt_b.bin", &l->linear_attn_dt_b},
+        {"weights/layer_%d_linear_attn_a_log.bin", &l->linear_attn_a_log},
         {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
     };
 
@@ -545,6 +549,15 @@ struct projected_ba {
     __bf16 a[32];
 };
 
+double sigmoid(double x) {
+    if (x >= 0) {
+        return 1.0 / (1.0 + exp(-x));
+    } else {
+        double exp_x = exp(x);
+        return exp_x / (1.0 + exp_x);
+    }
+}
+
 void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
                       const int pos, __bf16 *sin, __bf16 *cos) {
     const struct Config *c = &xfmr->config;
@@ -567,6 +580,12 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
             }
             qkvz->head[i].qkv[j] = tmp;
         }
+    }
+
+    struct projected_ba *ba = (struct projected_ba *)r->ba;
+    __bf16 beta[32] = {};
+    for (int i = 0; i < 32; ++i) {
+        beta[i] = sigmoid(ba->b[i]);
     }
 
     /*
