@@ -544,9 +544,13 @@ struct projected_qkvz {
     struct qkvz head[16];
 };
 
+struct ba {
+    __bf16 b[2];
+    __bf16 a[2];
+};
+
 struct projected_ba {
-    __bf16 b[32];
-    __bf16 a[32];
+    struct ba ba[16];
 };
 
 double sigmoid(double x) {
@@ -556,6 +560,18 @@ double sigmoid(double x) {
         double exp_x = exp(x);
         return exp_x / (1.0 + exp_x);
     }
+}
+
+float softplus(float x) {
+    // For large positive x, use approximation to avoid overflow
+    if (x > 20.0f) {
+        return x;
+    }
+    // For large negative x, return 0 to avoid underflow
+    if (x < -20.0f) {
+        return 0.0f;
+    }
+    return log1pf(expf(x));
 }
 
 void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
@@ -584,30 +600,38 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
     struct projected_ba *ba = (struct projected_ba *)r->ba;
     __bf16 beta[32] = {};
-    for (int i = 0; i < 32; ++i) {
-        beta[i] = sigmoid(ba->b[i]);
+    for (int i = 0; i < 16; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            beta[i * 2 + j] = sigmoid(ba->ba[i].b[j]);
+        }
     }
 
-    /*
-    projected_states_qkvz contains interleaved Q, K, V, and Z.
-    It is split into query, key, value, and z (plus b, a) using fix_query_key_value_ordering.
-    query, key, and value are reshaped and concatenated into a single tensor (e.g., shape [batch, seq_len, 8192]).
-    This concatenated tensor is transposed and passed through a grouped conv1d, which mixes information from previous
-    tokens. The output is SiLU activated. The result is transposed back and split into query, key, and value again, then
-    reshaped into attention heads for further processing.
+    float a[32] = {};
+    for (int i = 0; i < 16; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            a[i * 2 + j] = ba->ba[i].a[j];
+        }
+    }
 
+    for (int i = 0; i < 32; ++i) {
+        a[i] = a[i] + (float)m->layers[layer].linear_attn_dt_b[i];
+    }
 
+    for (int i = 0; i < 32; ++i) {
+        a[i] = softplus(a[i]);
+    }
 
-*/
+    // g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-    /* TODO: split r->qkvz into 16 heads (16 x 768)*/
-    /* TODO: split each head into qkvz (128+128+256+256) */
+    float nalogexp[32] = {};
+    for (int i = 0; i < 32; ++i) {
+        nalogexp[i] = -expf((float)m->layers[layer].linear_attn_a_log[i]);
+    }
 
-    /*
-     * TODO:
-     * ba split to 16 heads ( 16 x 4 )
-     * split each head into b,a (2+2)
-     */
+    float g[32] = {};
+    for (int i = 0; i < 32; ++i) {
+        g[i] = nalogexp[i] * a[i];
+    }
 
     volatile int dummy = 0;
 }
