@@ -540,6 +540,11 @@ struct projected_qkvz {
     struct qkvz head[16];
 };
 
+struct projected_ba {
+    __bf16 b[32];
+    __bf16 a[32];
+};
+
 void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
                       const int pos, __bf16 *sin, __bf16 *cos) {
     const struct Config *c = &xfmr->config;
