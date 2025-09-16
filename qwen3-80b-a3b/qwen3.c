@@ -103,6 +103,12 @@ void mul(__bf16 *out, const __bf16 *a, const __bf16 *b, int n) {
     }
 }
 
+void silu_array(__bf16 *output, const __bf16 *input, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        output[i] = input[i] / (1.0f + expf(-input[i]));
+    }
+}
+
 void rope_init(struct Config *c) {
 
 #if 0
@@ -553,6 +559,14 @@ struct projected_ba {
     struct ba ba[16];
 };
 
+struct conv1d_w {
+    __bf16 w[4];
+};
+
+// struct linear_conv1d_w {
+//     struct conv1d_w d[2048];
+// };
+
 double sigmoid(double x) {
     if (x >= 0) {
         return 1.0 / (1.0 + exp(-x));
@@ -588,14 +602,22 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
     /* conv1d over qkv - 8192 dimensions */
     for (int i = 0; i < 16; i++) {
+        struct conv1d_w *w = (struct conv1d_w *)m->layers[layer].linear_attn_conv1d_w;
         for (int j = 0; j < 512; j++) {
             __bf16 tmp = 0;
             for (int k = 0; k < 4; ++k) {
                 struct projected_qkvz *proj = (struct projected_qkvz *)r->qkvz[(pp + 1 + k) % 4];
-                tmp += proj->head[i].qkv[j] * m->layers[layer].linear_attn_conv1d_w[i * 512 * 4 + j * 4 + k];
+                tmp += proj->head[i].qkv[j] * w[i * 512 + j].w[k];
             }
             qkvz->head[i].qkv[j] = tmp;
         }
+    }
+
+    /* TODO: mixed_qkv is concatenated qkv (not interleaved)*/
+
+    /* silu on all 8192 elements */
+    for (int i = 0; i < 16; ++i) {
+        silu_array(qkvz->head[i].qkv, qkvz->head[i].qkv, 512);
     }
 
     struct projected_ba *ba = (struct projected_ba *)r->ba;
@@ -631,6 +653,13 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     float g[32] = {};
     for (int i = 0; i < 32; ++i) {
         g[i] = nalogexp[i] * a[i];
+    }
+
+    /* v shaped as 32 heads x 128 dim */
+    for (int i = 0; i < 32; i++) {
+        for (int j = 0; j < 128; j++) {
+            qkvz->head[i / 2].v[(i % 2 * 128) + j] *= beta[i];
+        }
     }
 
     volatile int dummy = 0;
@@ -693,12 +722,6 @@ void runtime_init(struct Transformer *xfmr) {
             r->layers[i].value[j].cache =
                 (__bf16 *)aligned_malloc(64, sizeof(__bf16) * c->max_position_embeddings * c->head_dim);
         }
-    }
-}
-
-void silu_array(__bf16 *output, const __bf16 *input, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        output[i] = input[i] / (1.0f + expf(-input[i]));
     }
 }
 
