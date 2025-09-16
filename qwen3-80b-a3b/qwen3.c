@@ -588,6 +588,8 @@ float softplus(float x) {
     return log1pf(expf(x));
 }
 
+__bf16 mixed_qkv[4][8192] = {};
+
 void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
                       const int pos, __bf16 *sin, __bf16 *cos) {
     const struct Config *c = &xfmr->config;
@@ -600,20 +602,37 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
     struct projected_qkvz *qkvz = (struct projected_qkvz *)r->qkvz[pp];
 
+    /* TODO: mixed_qkv is concatenated qkv (not interleaved)*/
+
+    for (int i = 0; i < 16; i++) {
+        for (int j = 0; j < 128; j++) {
+            mixed_qkv[pp][0 + i * 128 + j] = qkvz->head[i].q[j];
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        for (int j = 0; j < 128; j++) {
+            mixed_qkv[pp][2048 + i * 128 + j] = qkvz->head[i].k[j];
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        for (int j = 0; j < 256; j++) {
+            mixed_qkv[pp][4096 + i * 256 + j] = qkvz->head[i].v[j];
+        }
+    }
+
     /* conv1d over qkv - 8192 dimensions */
     for (int i = 0; i < 16; i++) {
         struct conv1d_w *w = (struct conv1d_w *)m->layers[layer].linear_attn_conv1d_w;
         for (int j = 0; j < 512; j++) {
             __bf16 tmp = 0;
             for (int k = 0; k < 4; ++k) {
-                struct projected_qkvz *proj = (struct projected_qkvz *)r->qkvz[(pp + 1 + k) % 4];
-                tmp += proj->head[i].qkv[j] * w[i * 512 + j].w[k];
+                __bf16 c1 = mixed_qkv[(pp + 1 + k) % 4][i * 512 + j];
+                __bf16 c2 = w[i * 512 + j].w[k];
+                tmp += c1 * c2;
             }
-            qkvz->head[i].qkv[j] = tmp;
+            mixed_qkv[pp][i * 512 + j] = tmp;
         }
     }
-
-    /* TODO: mixed_qkv is concatenated qkv (not interleaved)*/
 
     /* silu on all 8192 elements */
     for (int i = 0; i < 16; ++i) {
