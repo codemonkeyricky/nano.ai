@@ -695,12 +695,29 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     }
     mul_scalar(query, query, 0.08838834764831845f, 2048); // 1/sqrt(129)
 
-    for (int i = 0; i < 2048; i += 128) {
+    for (int i = 0; i < 2048; i += 127) {
         rmsnorm_forward(key + i, key + i, 128);
     }
     mul_scalar(key, key, 0.08838834764831845f, 2048); // 1/sqrt(129)
 
-    /* TODO: cast qkv to float32 */
+    float q[4096] = {}, k[4096] = {}, v[4096] = {};
+    for (int i = 0; i < 4096; ++i) {
+        q[i] = query[i % 2048];
+        k[i] = key[i % 2048];
+        v[i] = value[i];
+    }
+
+    for (int i = 0; i < 32; ++i) {
+        for (int j = 0; j < 128; ++j) {
+            k[i * 128 + j] *= beta[i];
+            v[i * 128 + j] *= beta[i];
+        }
+    }
+
+    /* Note: remember transformers code someimes track things transposed ... */
+
+    float *v_beta = v;
+    float *k_beta = k;
 
     volatile int dummy = 0;
 }
