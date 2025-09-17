@@ -103,6 +103,12 @@ void mul(__bf16 *out, const __bf16 *a, const __bf16 *b, int n) {
     }
 }
 
+void mul_scalar(__bf16 *out, const __bf16 *a, float b, int n) {
+    for (int i = 0; i < n; i++) {
+        out[i] = (__bf16)((float)a[i] * b);
+    }
+}
+
 void silu_array(__bf16 *output, const __bf16 *input, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         output[i] = input[i] / (1.0f + expf(-input[i]));
@@ -678,6 +684,23 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
             qkvz->head[i / 2].v[(i % 2 * 128) + j] *= beta[i];
         }
     }
+
+    __bf16 *query, *key, *value;
+    query = mixed_qkv[pp] + 0;
+    key = mixed_qkv[pp] + 2048;
+    value = mixed_qkv[pp] + 4096;
+
+    for (int i = 0; i < 2048; i += 128) {
+        rmsnorm_forward(query + i, query + i, 128);
+    }
+    mul_scalar(query, query, 0.08838834764831845f, 2048); // 1/sqrt(129)
+
+    for (int i = 0; i < 2048; i += 128) {
+        rmsnorm_forward(key + i, key + i, 128);
+    }
+    mul_scalar(key, key, 0.08838834764831845f, 2048); // 1/sqrt(129)
+
+    /* TODO: cast qkv to float32 */
 
     volatile int dummy = 0;
 }
