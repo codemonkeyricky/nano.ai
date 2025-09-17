@@ -620,24 +620,22 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         }
     }
 
+    /* TODO: save most recent 4 mixed_qkv[pp] for next iterations */
+
     /* conv1d over qkv - 8192 dimensions */
-    for (int i = 0; i < 16; i++) {
-        struct conv1d_w *w = (struct conv1d_w *)m->layers[layer].linear_attn_conv1d_w;
-        for (int j = 0; j < 512; j++) {
-            __bf16 tmp = 0;
-            for (int k = 0; k < 4; ++k) {
-                __bf16 c1 = mixed_qkv[(pp + 1 + k) % 4][i * 512 + j];
-                __bf16 c2 = w[i * 512 + j].w[k];
-                tmp += c1 * c2;
-            }
-            mixed_qkv[pp][i * 512 + j] = tmp;
+    struct conv1d_w *w = (struct conv1d_w *)m->layers[layer].linear_attn_conv1d_w;
+    for (int i = 0; i < 8192; i++) {
+        __bf16 tmp = 0;
+        for (int k = 0; k < 4; ++k) {
+            __bf16 c1 = mixed_qkv[(pp + 1 + k) % 4][i];
+            __bf16 c2 = w[i].w[k];
+            tmp += c1 * c2;
         }
+        mixed_qkv[pp][i] = tmp;
     }
 
     /* silu on all 8192 elements */
-    for (int i = 0; i < 16; ++i) {
-        silu_array(qkvz->head[i].qkv, qkvz->head[i].qkv, 512);
-    }
+    silu_array(mixed_qkv[pp], mixed_qkv[pp], 8192);
 
     struct projected_ba *ba = (struct projected_ba *)r->ba;
     __bf16 beta[32] = {};
