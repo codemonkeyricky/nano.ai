@@ -734,6 +734,10 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     }
     mul_scalar(key, key, 0.08838834764831845f, 2048); // 1/sqrt(129)
 
+    /*
+     * interleave: 16 heads to 32 heads
+     */
+
     float q[4096] = {}, k[4096] = {}, v[4096] = {};
     for (int i = 0; i < 4096; ++i) {
         q[i] = query[i % 2048];
@@ -748,24 +752,23 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         }
     }
 
-    /* insert into key cache */
+    /* insert into key cache, head by head */
     for (int h = 0; h < 32; ++h) {
         float *k_cache = r->layers[layer].key[h].cache + pos * 128;
         float *key = k + h * 128;
         memcpy(k_cache, key, sizeof(float) * 128);
     }
 
+    float *v_beta = v;
+    float *k_beta = k;
     for (int i = 0; i < 32; ++i) {
         for (int j = 0; j < 128; ++j) {
-            k[i * 128 + j] *= beta[i];
-            v[i * 128 + j] *= beta[i];
+            k_beta[i * 128 + j] *= beta[i];
+            v_beta[i * 128 + j] *= beta[i];
         }
     }
 
     /* Note: remember transformers code someimes track things transposed ... */
-
-    float *v_beta = v;
-    float *k_beta = k;
 
     /*
      * g = g.cumsum(dim=-1)
