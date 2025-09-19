@@ -70,7 +70,7 @@ struct Mmapping {
 };
 
 typedef struct {
-    __bf16 *cache;
+    float *cache;
 } Head;
 
 struct RLayer {
@@ -87,6 +87,7 @@ struct Runtime {
     __bf16 *h3;
     __bf16 *qkvz[4]; /* kernel_size */
     __bf16 *ba;
+    float (*g)[32]; // (*g)[64];
     struct RLayer *layers;
     char **lookup;
 };
@@ -373,6 +374,20 @@ void layernorm(__bf16 *out, const __bf16 *in, const __bf16 *weight, struct Trans
     mul(out, tmp2, tmp, c->hidden_size);
 }
 
+float dot_f32(float *__restrict x, float *__restrict w, int n) {
+
+    assert(n % 32 == 0);
+
+    x = __builtin_assume_aligned(x, 64);
+    w = __builtin_assume_aligned(w, 64);
+
+    float out = 0;
+    for (int j = 0; j < n; ++j) {
+        out += x[j] * w[j];
+    }
+    return out;
+}
+
 __bf16 dot(__bf16 *__restrict x, __bf16 *__restrict w, int n) {
 
     assert(n % 32 == 0);
@@ -406,6 +421,25 @@ void matmul_bias(__bf16 *__restrict out, const __bf16 *__restrict x, const __bf1
 
 void matmul(__bf16 *__restrict out, const __bf16 *__restrict x, const __bf16 *__restrict w, int n, int d) {
     matmul_bias(out, x, w, 0, n, d);
+}
+
+void matmul_bias_f32(float *__restrict out, const float *__restrict x, const float *__restrict w,
+                     const float *__restrict b, int n, int d) {
+    out = __builtin_assume_aligned(out, 64);
+    x = __builtin_assume_aligned(x, 64);
+    w = __builtin_assume_aligned(w, 64);
+    assert(n % 32 == 0);
+    assert(d % 32 == 0);
+    int i;
+    // #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float tmp = dot_f32(x, &w[i * n], n) + (b ? (float)b[i] : 0);
+        out[i] = tmp;
+    }
+}
+
+void matmul_f32(float *__restrict out, const float *__restrict x, const float *__restrict w, int n, int d) {
+    matmul_bias_f32(out, x, w, 0, n, d);
 }
 
 void add(__bf16 *out, const __bf16 *a, const __bf16 *b, int n) {
@@ -448,6 +482,7 @@ void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const st
 void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
                     const int pos, __bf16 *sin, __bf16 *cos) {
 
+#if 0
     const struct Config *p = &xfmr->config;
     const struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
@@ -529,8 +564,8 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
 
         /* y = att @ v // (1, T) x (T, hs) -> (1, hs) */
         for (int i = 0; i < hs; i++) {
-            __bf16 *vv = r->layers[layer].value[h / index].cache;
-            __bf16 *yy = y + h * hs; // (1, hs)
+            float *vv = r->layers[layer].value[h / index].cache;
+            float *yy = y + h * hs; // (1, hs)
             /* find v for the current head */
             yy[i] += dot(att, &vv[i * p->max_position_embeddings], (pos + 1 + 31) / 32 * 32);
         }
@@ -538,6 +573,7 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
 
     memcpy(x, y, attn_sz * sizeof(__bf16));
     matmul(y, x, ow, attn_sz, p->hidden_size);
+#endif
 }
 
 struct qkvz {
@@ -599,7 +635,7 @@ __bf16 mixed_qkv[4][8192] = {};
 void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
                       const int pos, __bf16 *sin, __bf16 *cos) {
     const struct Config *c = &xfmr->config;
-    const struct Runtime *r = &xfmr->runtime;
+    struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
     int pp = pos % 4;
 
@@ -666,8 +702,6 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         a[i] = softplus(a[i]);
     }
 
-    // g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-
     float nalogexp[32] = {};
     for (int i = 0; i < 32; ++i) {
         nalogexp[i] = -expf((float)m->layers[layer].linear_attn_a_log[i]);
@@ -695,7 +729,7 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     }
     mul_scalar(query, query, 0.08838834764831845f, 2048); // 1/sqrt(129)
 
-    for (int i = 0; i < 2048; i += 127) {
+    for (int i = 0; i < 2048; i += 128) {
         rmsnorm_forward(key + i, key + i, 128);
     }
     mul_scalar(key, key, 0.08838834764831845f, 2048); // 1/sqrt(129)
@@ -703,8 +737,22 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     float q[4096] = {}, k[4096] = {}, v[4096] = {};
     for (int i = 0; i < 4096; ++i) {
         q[i] = query[i % 2048];
-        k[i] = key[i % 2048];
         v[i] = value[i];
+    }
+
+    for (int h = 0; h < 16; ++h) {
+        for (int i = 0; i < 128; ++i) {
+            int k1 = (h * 2 + 0) * 128 + i;
+            int k2 = (h * 2 + 1) * 128 + i;
+            k[k1] = k[k2] = key[h * 128 + i];
+        }
+    }
+
+    /* insert into key cache */
+    for (int h = 0; h < 32; ++h) {
+        float *k_cache = r->layers[layer].key[h].cache + pos * 128;
+        float *key = k + h * 128;
+        memcpy(k_cache, key, sizeof(float) * 128);
     }
 
     for (int i = 0; i < 32; ++i) {
@@ -718,6 +766,53 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
     float *v_beta = v;
     float *k_beta = k;
+
+    /*
+     * g = g.cumsum(dim=-1)
+     * g is cumulative sum of decay factors
+     */
+    memcpy(r->g[pos], g, sizeof(float) * 32);
+    if (pos) {
+        for (int i = 0; i < 32; ++i) {
+            r->g[pos][i] += r->g[pos - 1][i];
+        }
+    }
+
+    /*
+     * decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+     *
+     * The transforrmers code generates decay for all pairs of indices, then
+     * apply a trianglar mask to remove the invalid ones (eg. current only
+     * decays into the past). The python code creates the matrix for all
+     * tokens, for decoding we only need one row.
+     *
+     * While g can be re-used, decay_mask needs to be re-calculated as current
+     * moves forward.
+     */
+    float decay_mask[32][64] = {};
+    for (int h = 0; h < 32; ++h) {
+        for (int i = 0; i <= pos; ++i) {
+            decay_mask[h][i] = expf(r->g[h][pos] - r->g[h][i]);
+        }
+    }
+
+    /*
+     * attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+     *
+     * Run current k_beta against all previous keys
+     */
+    float attn[32][64] = {};
+    for (int h = 0; h < 32; ++h) {
+        for (int i = 0; i < 4096; i += 128) {
+            float *key = r->layers[layer].key[h].cache + i;
+            matmul_f32(&attn[h][i / 128], k_beta, key, 128, 128);
+        }
+    }
+
+    /*
+     * g represents accumulates every token
+     * decay_mask is re-calculated every token, since older tokens decay more
+     */
 
     volatile int dummy = 0;
 }
@@ -770,14 +865,17 @@ void runtime_init(struct Transformer *xfmr) {
 
     r->layers = (struct RLayer *)calloc(sizeof(struct RLayer), c->n_layers);
 
+    /* chunk decay - multiple of 64 */
+    r->g = (float (*)[32])aligned_malloc(64, sizeof(float) * 32 * 12288);
+
     for (size_t i = 0; i < c->n_layers; i++) {
-        r->layers[i].key = (Head *)calloc(sizeof(Head), c->kv_heads);
-        r->layers[i].value = (Head *)calloc(sizeof(Head), c->kv_heads);
-        for (size_t j = 0; j < c->kv_heads; ++j) {
-            r->layers[i].key[j].cache =
-                (__bf16 *)aligned_malloc(64, sizeof(__bf16) * c->max_position_embeddings * c->head_dim);
-            r->layers[i].value[j].cache =
-                (__bf16 *)aligned_malloc(64, sizeof(__bf16) * c->max_position_embeddings * c->head_dim);
+        r->layers[i].key = (Head *)calloc(sizeof(Head), 32);
+        r->layers[i].value = (Head *)calloc(sizeof(Head), 32);
+        for (size_t j = 0; j < 32; ++j) {
+            r->layers[i].key[j].cache = calloc(1, sizeof(float) * 4096 * c->head_dim);
+            assert(r->layers[i].key[j].cache);
+            r->layers[i].value[j].cache = calloc(1, sizeof(float) * 4096 * c->head_dim);
+            assert(r->layers[i].value[j].cache);
         }
     }
 }
