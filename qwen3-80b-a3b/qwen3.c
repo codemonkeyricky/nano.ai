@@ -429,7 +429,7 @@ void matmul_bias_f32(float *__restrict out, const float *__restrict x, const flo
     x = __builtin_assume_aligned(x, 64);
     w = __builtin_assume_aligned(w, 64);
     assert(n % 32 == 0);
-    assert(d % 32 == 0);
+    // assert(d % 32 == 0);
     int i;
     // #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
@@ -759,6 +759,8 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         memcpy(k_cache, key, sizeof(float) * 128);
     }
 
+    /* k_beta and v_beta are both 32 x 128 */
+
     float *v_beta = v;
     float *k_beta = k;
     for (int i = 0; i < 32; ++i) {
@@ -803,12 +805,15 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
      * attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
      *
      * Run current k_beta against all previous keys
+     * 
+     * (k_beta @ key.transpose(-1, -2))[0][h][0][0][:16]
+     * heads is the 2nd column
      */
     float attn[32][64] = {};
     for (int h = 0; h < 32; ++h) {
-        for (int i = 0; i < 4096; i += 128) {
-            float *key = r->layers[layer].key[h].cache + i;
-            matmul_f32(&attn[h][i / 128], k_beta, key, 128, 128);
+        for (int p = 0; p <= pos; ++p) {
+            float *key = r->layers[layer].key[h].cache + pos * 128;
+            matmul_f32(&attn[h][p], k_beta + h * 128, key, 128, 1);
         }
     }
 
