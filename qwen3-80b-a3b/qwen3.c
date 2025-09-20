@@ -805,7 +805,7 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
      * attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
      *
      * Run current k_beta against all previous keys
-     * 
+     *
      * (k_beta @ key.transpose(-1, -2))[0][h][0][0][:16]
      * heads is the 2nd column
      */
@@ -814,6 +814,22 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         for (int p = 0; p <= pos; ++p) {
             float *key = r->layers[layer].key[h].cache + pos * 128;
             matmul_f32(&attn[h][p], k_beta + h * 128, key, 128, 1);
+        }
+    }
+
+    /* TODO: hack for now */
+    for (int i = 0; i < 32; ++i) {
+        attn[i][pos] = 1;
+    }
+
+    float v_beta2[32][64][128] = {};
+    float value2[32][64][128] = {};
+
+    for (int h = 0; h < 32; ++h) {
+        for (int d = 0; d < 128; ++d) {
+            for (int j = 0; j <= pos; ++j) {
+                value2[h][pos][d] += attn[h][j] * value2[h][j][d];
+            }
         }
     }
 
