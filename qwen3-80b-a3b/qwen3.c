@@ -101,7 +101,7 @@ struct RLayer {
     // Head *key;
     // Head *value;
     struct Attention *attn;
-    struct Attention *query;
+    struct Projection *query;
     struct AttentionChunk *attn_cache;
     struct ProjectionChunk *k_cache;
     struct ProjectionChunk *v_cache;
@@ -350,6 +350,25 @@ void norm(__bf16 *out, const __bf16 *in, const __bf16 *weight, const int len, st
 
     for (int i = 0; i < len; i++) {
         out[i] = ((__bf16)((float)in[i] * denom)) * (float)weight[i];
+    }
+}
+
+void l2norm_forward(__bf16 *out, __bf16 *in, int dim) {
+    const float eps = 1e-6f; // Small epsilon value to avoid division by zero
+
+    // Calculate sum of squares (convert to float for precision)
+    float sum_squares = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        float val = (float)in[i]; // Convert bf16 to float
+        sum_squares += val * val;
+    }
+
+    // Calculate reciprocal square root of (sum_squares + eps)
+    float rsqrt_val = 1.0f / sqrtf(sum_squares + eps);
+
+    for (int i = 0; i < dim; i++) {
+        float val = (float)in[i];
+        out[i] = (__bf16)(val * rsqrt_val);
     }
 }
 
@@ -772,15 +791,16 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     key = mixed_qkv[pp] + 2048;
     value = mixed_qkv[pp] + 4096;
 
+    /* query is normalized and scaled */
     for (int i = 0; i < 2048; i += 128) {
-        rmsnorm_forward(query + i, query + i, 128);
+        l2norm_forward(query + i, query + i, 128);
     }
     mul_scalar(query, query, 0.08838834764831845f, 2048); // 1/sqrt(129)
 
+    /* key is normalized not scaled */
     for (int i = 0; i < 2048; i += 128) {
-        rmsnorm_forward(key + i, key + i, 128);
+        l2norm_forward(key + i, key + i, 128);
     }
-    mul_scalar(key, key, 0.08838834764831845f, 2048); // 1/sqrt(129)
 
     /*
      * interleave: 16 heads to 32 heads
@@ -802,6 +822,11 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
     int chunk = pos / 64;
     int offset = pos % 64;
+
+    for (int h = 0; h < 32; ++h) {
+        float *query = (float *)r->layers[layer].query[h].attn;
+        memcpy(query, q + h * 128, sizeof(float) * 128);
+    }
 
     /* insert into key cache, head by head */
     for (int h = 0; h < 32; ++h) {
@@ -966,13 +991,11 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
          */
 
         /* attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0) */
-        struct Attention *q = r->layers[layer].query;
-        struct ProjectionChunk *k_chunk = &r->layers[layer].k_cache[chunk];
         struct Attention *attn = r->layers[layer].attn;
         for (int h = 0; h < 32; ++h) {
-            /* q_i @ k_i.transpose(-1, -2) */
-            matmul_f32(attn->attn[h], q->attn[h], (float *)k_chunk->attn[h], 128, 64);
-            /* TODO: decay_mask[:, :, i] */
+            float *q = r->layers[layer].query->attn[h];
+            float *k = (float *)r->layers[layer].k_cache[chunk].attn[h];
+            matmul_f32(attn->attn[h], q, k, 128, 64);
         }
     }
 
@@ -1080,10 +1103,13 @@ void runtime_init(struct Transformer *xfmr) {
         r->layers[i].k_beta_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
         r->layers[i].k_beta_exp_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
         r->layers[i].value = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        r->layers[i].query = (struct Projection *)calloc(chunks, sizeof(struct Projection));
 
         r->layers[i].k_cumdecay = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
 
-        r->layers[i].last_recurrent_state = (struct RecurrentState *)calloc(1, sizeof(struct ProjectionChunk));
+        r->layers[i].last_recurrent_state = (struct RecurrentState *)calloc(1, sizeof(struct RecurrentState));
+
+        r->layers[i].core_attn_out = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
 
         r->layers[i].g = (struct DecayChunk *)calloc(chunks, sizeof(struct DecayChunk));
         r->layers[i].beta = (struct DecayChunk *)calloc(chunks, sizeof(struct DecayChunk));
