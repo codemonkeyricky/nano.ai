@@ -439,6 +439,14 @@ __bf16 dot(__bf16 *__restrict x, __bf16 *__restrict w, int n) {
     return _mm512_reduce_add_ps(acc);
 }
 
+void transpose(float *out, const float *in, int n, int m) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < m; j++) {
+            out[j * n + i] = in[i * m + j];
+        }
+    }
+}
+
 void matmul_bias(__bf16 *__restrict out, const __bf16 *__restrict x, const __bf16 *__restrict w,
                  const __bf16 *__restrict b, int n, int d) {
     out = __builtin_assume_aligned(out, 64);
@@ -797,6 +805,12 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         memcpy(k_cache, key, sizeof(float) * 128);
     }
 
+    for (int h = 0; h < 32; ++h) {
+        float *v_cache = r->layers[layer].v_cache[chunk].attn[h][offset];
+        float *value = v + h * 128;
+        memcpy(v_cache, value, sizeof(float) * 128);
+    }
+
     /*
      * ==========================================================
      */
@@ -846,9 +860,43 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
      */
     for (int h = 0; h < 32; ++h) {
         float *decay_mask = r->layers[layer].decay_mask[chunk].attn[h][pos];
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i <= pos; ++i) {
             decay_mask[i] = expf(r->g[h][pos] - r->g[h][i]);
         }
+    }
+
+    /*
+     *  mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
+     *  attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+     *  for i in range(1, chunk_size):
+     *      row = attn[..., i, :i].clone()
+     *      sub = attn[..., :i, :i].clone()
+     *      attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+     *  attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+     *
+     *  TODO: implement the above more efficient recurrent calculation
+     */
+
+    for (int h = 0; h < 32; ++h) {
+        float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h];
+        float *k_cache = (float *)r->layers[layer].k_cache[chunk].attn[h];
+        float *k_beta = (float *)r->layers[layer].k_beta_cache[chunk].attn[h];
+
+        /* upper triangular mask is zero */
+        for (int i = 0; i < offset; ++i) {
+            for (int j = 0; j < offset; ++j) {
+                attn[i * 64 + j] = dot_f32(&k_beta[i * 128], &k_cache[j * 128], 128);
+            }
+        }
+
+        /* TODO: */
+
+        /* attn = attn + torch.eye */
+        for (int i = 0; i <= offset; ++i) {
+            attn[i * 64 + i] = 1.0f;
+        }
+
+        volatile int dummy = 0;
     }
 
     /*
@@ -999,6 +1047,14 @@ void runtime_init(struct Transformer *xfmr) {
         r->layers[i].v_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
         r->layers[i].v_beta_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
         r->layers[i].k_beta_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        r->layers[i].value = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+
+        r->layers[i].g = (struct DecayChunk *)calloc(chunks, sizeof(struct DecayChunk));
+        r->layers[i].beta = (struct DecayChunk *)calloc(chunks, sizeof(struct DecayChunk));
+
+        r->layers[i].decay_mask = (struct AttentionChunk *)calloc(chunks, sizeof(struct AttentionChunk));
+
+        r->layers[i].attn_cache = (struct AttentionChunk *)calloc(chunks, sizeof(struct AttentionChunk));
     }
 }
 
