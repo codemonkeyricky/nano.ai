@@ -73,9 +73,35 @@ typedef struct {
     float *cache;
 } Head;
 
+struct Attention {
+    float attn[32][64];
+};
+
+struct AttentionChunk {
+    float attn[32][64][64];
+};
+
+struct Projection {
+    float attn[32][128];
+};
+
+struct BetaChunk {
+    float beta[32][64];
+};
+
+struct ProjectionChunk {
+    float attn[32][64][128];
+};
+
 struct RLayer {
     Head *key;
     Head *value;
+    struct Attention *attn;
+    struct AttentionChunk *attn_chunk;
+    struct ProjectionChunk *k_cache;
+    struct ProjectionChunk *v_cache;
+    struct ProjectionChunk *k_beta_cache;
+    struct ProjectionChunk *v_beta_cache;
 };
 
 struct Runtime {
@@ -88,6 +114,7 @@ struct Runtime {
     __bf16 *qkvz[4]; /* kernel_size */
     __bf16 *ba;
     float (*g)[32]; // (*g)[64];
+
     struct RLayer *layers;
     char **lookup;
 };
@@ -752,21 +779,26 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         }
     }
 
+    int chunk = pos / 64;
+    int offset = pos % 64;
+
     /* insert into key cache, head by head */
     for (int h = 0; h < 32; ++h) {
-        float *k_cache = r->layers[layer].key[h].cache + pos * 128;
+        float *k_cache = r->layers[layer].k_cache[chunk].attn[h][offset];
         float *key = k + h * 128;
         memcpy(k_cache, key, sizeof(float) * 128);
     }
 
     /* k_beta and v_beta are both 32 x 128 */
 
-    float *v_beta = v;
-    float *k_beta = k;
-    for (int i = 0; i < 32; ++i) {
+    struct ProjectionChunk *v_beta = v;
+    struct ProjectionChunk *k_beta = k;
+    for (int h = 0; h < 32; ++h) {
+        float *vb = r->layers[layer].v_beta_cache[chunk].attn[h][offset];
+        float *kb = r->layers[layer].k_beta_cache[chunk].attn[h][offset];
         for (int j = 0; j < 128; ++j) {
-            k_beta[i * 128 + j] *= beta[i];
-            v_beta[i * 128 + j] *= beta[i];
+            vb[j] *= beta[h];
+            kb[j] *= beta[h];
         }
     }
 
@@ -825,7 +857,7 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     float v_beta2[32][64][128] = {};
     float value2[32][64][128] = {};
 
-    /* 
+    /*
      * calculate attention attenuated value
      */
     for (int h = 0; h < 32; ++h) {
@@ -840,7 +872,6 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
      * g represents accumulates every token
      * decay_mask is re-calculated every token, since older tokens decay more
      */
-
 
     volatile int dummy = 0;
 }
