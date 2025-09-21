@@ -809,11 +809,13 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
      */
 
     for (int h = 0; h < 32; ++h) {
+        float *v = r->layers[layer].v_cache[chunk].attn[h][offset];
+        float *k = r->layers[layer].k_cache[chunk].attn[h][offset];
         float *vb = r->layers[layer].v_beta_cache[chunk].attn[h][offset];
         float *kb = r->layers[layer].k_beta_cache[chunk].attn[h][offset];
         for (int j = 0; j < 128; ++j) {
-            vb[j] *= beta[h];
-            kb[j] *= beta[h];
+            vb[j] = v[j] * beta[h];
+            kb[j] = k[j] * beta[h];
         }
     }
 
@@ -991,16 +993,13 @@ void runtime_init(struct Transformer *xfmr) {
     /* chunk decay - multiple of 64 */
     r->g = (float (*)[32])aligned_malloc(64, sizeof(float) * 32 * 12288);
 
-    // for (size_t i = 0; i < c->n_layers; i++) {
-    //     r->layers[i].key = (Head *)calloc(sizeof(Head), 32);
-    //     r->layers[i].value = (Head *)calloc(sizeof(Head), 32);
-    //     for (size_t j = 0; j < 32; ++j) {
-    //         r->layers[i].key[j].cache = calloc(1, sizeof(float) * 4096 * c->head_dim);
-    //         assert(r->layers[i].key[j].cache);
-    //         r->layers[i].value[j].cache = calloc(1, sizeof(float) * 4096 * c->head_dim);
-    //         assert(r->layers[i].value[j].cache);
-    //     }
-    // }
+    int chunks = 12288 / 64;
+    for (size_t i = 0; i < c->n_layers; i++) {
+        r->layers[i].k_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        r->layers[i].v_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        r->layers[i].v_beta_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        r->layers[i].k_beta_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+    }
 }
 
 void token_init(struct Transformer *xfmr, const char *tokenizer_path) {
