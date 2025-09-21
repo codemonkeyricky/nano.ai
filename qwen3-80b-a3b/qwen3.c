@@ -825,6 +825,9 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     float v_beta2[32][64][128] = {};
     float value2[32][64][128] = {};
 
+    /* 
+     * calculate attention attenuated value
+     */
     for (int h = 0; h < 32; ++h) {
         for (int d = 0; d < 128; ++d) {
             for (int j = 0; j <= pos; ++j) {
@@ -837,6 +840,7 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
      * g represents accumulates every token
      * decay_mask is re-calculated every token, since older tokens decay more
      */
+
 
     volatile int dummy = 0;
 }
