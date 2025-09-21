@@ -797,20 +797,37 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         memcpy(k_cache, key, sizeof(float) * 128);
     }
 
-    /* 
+    /*
      * ==========================================================
      */
 
-    /* k_beta and v_beta are both 32 x 128 */
+    /*
+     * v_beta = value * beta.unsqueeze(-1)
+     * k_beta = key * beta.unsqueeze(-1)
+     *
+     * k_beta and v_beta are both 32 x 128
+     */
 
-    struct ProjectionChunk *v_beta = v;
-    struct ProjectionChunk *k_beta = k;
     for (int h = 0; h < 32; ++h) {
         float *vb = r->layers[layer].v_beta_cache[chunk].attn[h][offset];
         float *kb = r->layers[layer].k_beta_cache[chunk].attn[h][offset];
         for (int j = 0; j < 128; ++j) {
             vb[j] *= beta[h];
             kb[j] *= beta[h];
+        }
+    }
+
+    struct ProjectionChunk *v_beta = r->layers[layer].v_beta_cache;
+    struct ProjectionChunk *k_beta = r->layers[layer].k_beta_cache;
+
+    /*
+     * g = g.cumsum(dim=-1)
+     * g is cumulative sum of decay factors
+     */
+    for (int h = 0; h < 32; ++h) {
+        r->layers[layer].g->decay[h][pos] = g[h];
+        if (pos) {
+            r->layers[layer].g->decay[h][pos] += r->layers[layer].g->decay[h][pos - 1];
         }
     }
 
@@ -860,17 +877,6 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     }
 
     /* Note: remember transformers code someimes track things transposed ... */
-
-    /*
-     * g = g.cumsum(dim=-1)
-     * g is cumulative sum of decay factors
-     */
-    memcpy(r->g[pos], g, sizeof(float) * 32);
-    if (pos) {
-        for (int i = 0; i < 32; ++i) {
-            r->g[pos][i] += r->g[pos - 1][i];
-        }
-    }
 
     /*
      * decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
