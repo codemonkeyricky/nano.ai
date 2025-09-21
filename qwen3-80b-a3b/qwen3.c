@@ -832,13 +832,31 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     }
 
     /*
+     * decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+     *
+     * The transforrmers code generates decay for all pairs of indices, then
+     * apply a trianglar mask to remove the invalid ones (eg. current only
+     * decays into the past). The python code creates the matrix for all
+     * tokens, for decoding we only need one row.
+     *
+     * While g can be re-used, decay_mask needs to be re-calculated as current
+     * moves forward.
+     */
+    for (int h = 0; h < 32; ++h) {
+        float *decay_mask = r->layers[layer].decay_mask[chunk].attn[h][pos];
+        for (int i = 0; i < 64; ++i) {
+            decay_mask[i] = expf(r->g[h][pos] - r->g[h][i]);
+        }
+    }
+
+    /*
      * value = attn @ v_beta
      * 64x128 = 64x64 @ 64x128
      */
     for (int h = 0; h < 32; ++h) {
-        float *attn = r->layers[layer].attn_cache[chunk].attn[h];
-        float *v_beta = r->layers[layer].v_beta_cache[chunk].attn[h];
-        float *value = r->layers[layer].value[chunk].attn[h];
+        float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h];
+        float *v_beta = (float *)r->layers[layer].v_beta_cache[chunk].attn[h];
+        float *value = (float *)r->layers[layer].value[chunk].attn[h];
         matmul_f32(value, attn, v_beta, 64, 128);
     }
 
@@ -846,8 +864,9 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
     /* k_cumdecay = attn @ (v_beta * g.exp()) */
     for (int h = 0; h < 32; ++h) {
-        float *attn = r->layers[layer].attn_cache[chunk].attn[h];
-        float *k_cumdecay = r->layers[layer].k_cumdecay[chunk].attn[h];
+        float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h];
+        float *v_beta = (float *)r->layers[layer].v_beta_cache[chunk].attn[h];
+        float *k_cumdecay = (float *)r->layers[layer].k_cumdecay[chunk].attn[h];
         matmul_f32(k_cumdecay, attn, v_beta, 64, 128);
     }
 
@@ -866,35 +885,17 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
          */
 
         /* attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0) */
-        struct Projection *q = r->layers[layer].query;
+        struct Attention *q = r->layers[layer].query;
         struct ProjectionChunk *k_chunk = &r->layers[layer].k_cache[chunk];
         struct Attention *attn = r->layers[layer].attn;
         for (int h = 0; h < 32; ++h) {
             /* q_i @ k_i.transpose(-1, -2) */
-            matmul_f32(attn->attn[h], q->attn[h], k_chunk->attn[h], 128, 64);
+            matmul_f32(attn->attn[h], q->attn[h], (float *)k_chunk->attn[h], 128, 64);
             /* TODO: decay_mask[:, :, i] */
         }
     }
 
     /* Note: remember transformers code someimes track things transposed ... */
-
-    /*
-     * decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-     *
-     * The transforrmers code generates decay for all pairs of indices, then
-     * apply a trianglar mask to remove the invalid ones (eg. current only
-     * decays into the past). The python code creates the matrix for all
-     * tokens, for decoding we only need one row.
-     *
-     * While g can be re-used, decay_mask needs to be re-calculated as current
-     * moves forward.
-     */
-    float decay_mask[32][64] = {};
-    for (int h = 0; h < 32; ++h) {
-        for (int i = 0; i <= pos; ++i) {
-            decay_mask[h][i] = expf(r->g[h][pos] - r->g[h][i]);
-        }
-    }
 
     /*
      * attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
@@ -904,32 +905,32 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
      * (k_beta @ key.transpose(-1, -2))[0][h][0][0][:16]
      * heads is the 2nd column
      */
-    float attn[32][64] = {};
-    for (int h = 0; h < 32; ++h) {
-        for (int p = 0; p <= pos; ++p) {
-            float *key = r->layers[layer].key[h].cache + pos * 128;
-            matmul_f32(&attn[h][p], k_beta + h * 128, key, 128, 1);
-        }
-    }
+    // float attn[32][64] = {};
+    // for (int h = 0; h < 32; ++h) {
+    //     for (int p = 0; p <= pos; ++p) {
+    //         float *key = r->layers[layer].key[h].cache + pos * 128;
+    //         matmul_f32(&attn[h][p], k_beta + h * 128, key, 128, 1);
+    //     }
+    // }
 
-    /* TODO: hack for now */
-    for (int i = 0; i < 32; ++i) {
-        attn[i][pos] = 1;
-    }
+    // /* TODO: hack for now */
+    // for (int i = 0; i < 32; ++i) {
+    //     attn[i][pos] = 1;
+    // }
 
-    float v_beta2[32][64][128] = {};
-    float value2[32][64][128] = {};
+    // float v_beta2[32][64][128] = {};
+    // float value2[32][64][128] = {};
 
     /*
      * calculate attention attenuated value
      */
-    for (int h = 0; h < 32; ++h) {
-        for (int d = 0; d < 128; ++d) {
-            for (int j = 0; j <= pos; ++j) {
-                value2[h][pos][d] += attn[h][j] * value2[h][j][d];
-            }
-        }
-    }
+    // for (int h = 0; h < 32; ++h) {
+    //     for (int d = 0; d < 128; ++d) {
+    //         for (int j = 0; j <= pos; ++j) {
+    //             value2[h][pos][d] += attn[h][j] * value2[h][j][d];
+    //         }
+    //     }
+    // }
 
     /*
      * g represents accumulates every token
@@ -990,16 +991,16 @@ void runtime_init(struct Transformer *xfmr) {
     /* chunk decay - multiple of 64 */
     r->g = (float (*)[32])aligned_malloc(64, sizeof(float) * 32 * 12288);
 
-    for (size_t i = 0; i < c->n_layers; i++) {
-        r->layers[i].key = (Head *)calloc(sizeof(Head), 32);
-        r->layers[i].value = (Head *)calloc(sizeof(Head), 32);
-        for (size_t j = 0; j < 32; ++j) {
-            r->layers[i].key[j].cache = calloc(1, sizeof(float) * 4096 * c->head_dim);
-            assert(r->layers[i].key[j].cache);
-            r->layers[i].value[j].cache = calloc(1, sizeof(float) * 4096 * c->head_dim);
-            assert(r->layers[i].value[j].cache);
-        }
-    }
+    // for (size_t i = 0; i < c->n_layers; i++) {
+    //     r->layers[i].key = (Head *)calloc(sizeof(Head), 32);
+    //     r->layers[i].value = (Head *)calloc(sizeof(Head), 32);
+    //     for (size_t j = 0; j < 32; ++j) {
+    //         r->layers[i].key[j].cache = calloc(1, sizeof(float) * 4096 * c->head_dim);
+    //         assert(r->layers[i].key[j].cache);
+    //         r->layers[i].value[j].cache = calloc(1, sizeof(float) * 4096 * c->head_dim);
+    //         assert(r->layers[i].value[j].cache);
+    //     }
+    // }
 }
 
 void token_init(struct Transformer *xfmr, const char *tokenizer_path) {
