@@ -882,12 +882,21 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         float *k_cache = (float *)r->layers[layer].k_cache[chunk].attn[h];
         float *k_beta = (float *)r->layers[layer].k_beta_cache[chunk].attn[h];
 
-        /* upper triangular mask is zero */
+        matmul_f32(attn, k_beta, k_cache, 128, offset);
+
+        // Zero out the upper triangular part
         for (int i = 0; i < offset; ++i) {
-            for (int j = 0; j < offset; ++j) {
-                attn[i * 64 + j] = dot_f32(&k_beta[i * 128], &k_cache[j * 128], 128);
+            for (int j = i + 1; j < offset; ++j) {
+                attn[i * offset + j] = 0.0f;
             }
         }
+
+        // /* upper triangular mask is zero */
+        // for (int i = 0; i < offset; ++i) {
+        //     for (int j = 0; j < offset; ++j) {
+        //         attn[i * 64 + j] = dot_f32(&k_beta[i * 128], &k_cache[j * 128], 128);
+        //     }
+        // }
 
         /* TODO: */
 
@@ -907,7 +916,30 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h];
         float *v_beta = (float *)r->layers[layer].v_beta_cache[chunk].attn[h];
         float *value = (float *)r->layers[layer].value[chunk].attn[h];
-        matmul_f32(value, attn, v_beta, 64, 128);
+
+        // float tmp[128][64] = {};
+        // transpose((float *)tmp, v_beta, 64, 128);
+
+        //     for i in range(64):          # rows of attn
+        // for j in range(128):     # columns of v_beta
+        //     total = 0.0
+        //     for k in range(64):  # common dimension (columns of attn, rows of v_beta)
+        //         total += attn[i][k] * v_beta[k][j]
+        //     result[i][j] = total
+
+        for (int i = 0; i < 64; ++i) {      // rows of attn
+            for (int j = 0; j < 128; ++j) { // columns of v_beta
+                float sum = 0.0f;
+                for (int k = 0; k < 64; ++k) { // common dimension (columns of attn, rows of v_beta)
+                    sum += attn[i * 64 + k] * v_beta[k * 128 + j];
+                }
+                value[i * 128 + j] = sum;
+            }
+        }
+
+        // matmul_f32(value, attn, v_beta, 64, 128);
+
+        volatile int dummy = 0;
     }
 
     /* TODO: (v_beta * g.exp()) */
