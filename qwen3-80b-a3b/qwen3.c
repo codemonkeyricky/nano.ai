@@ -100,7 +100,7 @@ struct RecurrentState {
 struct RLayer {
     // Head *key;
     // Head *value;
-    struct Attention *attn;
+    struct AttentionChunk *attn_cache2;
     struct Projection *query;
     struct AttentionChunk *attn_cache;
     struct ProjectionChunk *k_cache;
@@ -991,11 +991,18 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
          */
 
         /* attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0) */
-        struct Attention *attn = r->layers[layer].attn;
-        for (int h = 0; h < 32; ++h) {
-            float *q = r->layers[layer].query->attn[h];
-            float *k = (float *)r->layers[layer].k_cache[chunk].attn[h];
-            matmul_f32(attn->attn[h], q, k, 128, 64);
+
+        for (int pp = 0; pp <= offset; ++pp) {
+            for (int h = 0; h < 32; ++h) {
+                float *q = r->layers[layer].query->attn[h];
+                float *k = (float *)r->layers[layer].k_cache[chunk].attn[h][pp];
+                float *attn = (float *)r->layers[layer].attn_cache2->attn[h][pp];
+                matmul_f32(attn, q, k, 128, 64);
+
+                /* TODO: decay_mask */
+
+                volatile int dummy = 0;
+            }
         }
     }
 
@@ -1117,6 +1124,7 @@ void runtime_init(struct Transformer *xfmr) {
         r->layers[i].decay_mask = (struct AttentionChunk *)calloc(chunks, sizeof(struct AttentionChunk));
 
         r->layers[i].attn_cache = (struct AttentionChunk *)calloc(chunks, sizeof(struct AttentionChunk));
+        r->layers[i].attn_cache2 = (struct AttentionChunk *)calloc(chunks, sizeof(struct AttentionChunk));
     }
 }
 
