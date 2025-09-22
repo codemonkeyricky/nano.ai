@@ -138,6 +138,12 @@ struct Transformer {
     struct Runtime runtime;
 };
 
+void mul_f32(float *out, const float *a, const float *b, int n) {
+    for (int i = 0; i < n; i++) {
+        out[i] = (float)a[i] * (float)b[i];
+    }
+}
+
 void mul(__bf16 *out, const __bf16 *a, const __bf16 *b, int n) {
     for (int i = 0; i < n; i++) {
         out[i] = (__bf16)((float)a[i] * (float)b[i]);
@@ -992,17 +998,15 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
         /* attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0) */
 
-        for (int pp = 0; pp <= offset; ++pp) {
-            for (int h = 0; h < 32; ++h) {
-                float *q = r->layers[layer].query->attn[h];                        /* 1x1x128 */
-                float *k = (float *)r->layers[layer].k_cache[chunk].attn[h];       /* 1x64x128 */
-                float *attn = (float *)r->layers[layer].attn_cache2->attn[h][pos]; /* 1x64 */
-                matmul_f32(attn, q, k, 128, 64);
+        for (int h = 0; h < 32; ++h) {
+            float *q = r->layers[layer].query->attn[h];                        /* 1x1x128 */
+            float *k = (float *)r->layers[layer].k_cache[chunk].attn[h];       /* 1x64x128 */
+            float *attn = (float *)r->layers[layer].attn_cache2->attn[h][pos]; /* 1x64 */
+            matmul_f32(attn, q, k, 128, 64);
 
-                /* TODO: decay_mask */
+            mul_f32(attn, attn, r->layers[layer].decay_mask[chunk].attn[h][pp], 64);
 
-                volatile int dummy = 0;
-            }
+            volatile int dummy = 0;
         }
     }
 
