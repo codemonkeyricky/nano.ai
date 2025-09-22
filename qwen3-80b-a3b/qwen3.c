@@ -138,6 +138,12 @@ struct Transformer {
     struct Runtime runtime;
 };
 
+void subtract_f32(float *out, const float *a, const float *b, int n) {
+    for (int i = 0; i < n; i++) {
+        out[i] = a[i] - b[i];
+    }
+}
+
 void mul_f32(float *out, const float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) {
         out[i] = (float)a[i] * (float)b[i];
@@ -990,23 +996,29 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
     int chunks = ((pos + 1) + 63) / 64;
     for (int chunk = 0; chunk < chunks; ++chunk) {
-        /*
-         * query -> 32x1x128
-         * k_chunk -> 32x64x128
-         * attn -> 32x1x64
-         */
 
         /* attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0) */
-
         for (int h = 0; h < 32; ++h) {
             float *q = r->layers[layer].query->attn[h];                        /* 1x1x128 */
             float *k = (float *)r->layers[layer].k_cache[chunk].attn[h];       /* 1x64x128 */
             float *attn = (float *)r->layers[layer].attn_cache2->attn[h][pos]; /* 1x64 */
             matmul_f32(attn, q, k, 128, 64);
-
             mul_f32(attn, attn, r->layers[layer].decay_mask[chunk].attn[h][pp], 64);
+        }
 
-            volatile int dummy = 0;
+        /* v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state */
+        float v_prime[32][64][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            float *k_cumdecay = (float *)r->layers[layer].k_cumdecay[chunk].attn[h];        /* 64x128 */
+            float *recurrent = (float *)r->layers[layer].last_recurrent_state[chunk].decay; /* 128x128 */
+            float *vp = (float *)v_prime[h];                                                /* 64x128 */
+            float tmp[128][128] = {};
+            transpose((float *)tmp, recurrent, 128, 128);
+            matmul_f32(vp, k_cumdecay, (float *)tmp, 64, 128);
+        }
+
+        /* v_new = v_i - v_prime */
+        for (int h = 0; h < 32; ++h) {
         }
     }
 
