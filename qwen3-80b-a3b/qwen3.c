@@ -1018,8 +1018,9 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         }
 
         /* v_new = v_i - v_prime */
-        for (int h = 0; h < 32; ++h) {
-        }
+        float v_new[32][64][128] = {};
+        float *v_i = r->layers[layer].value[chunk].attn;
+        subtract_f32(v_new, v_i, v_prime, 32 * 64 * 128);
     }
 
     /* Note: remember transformers code someimes track things transposed ... */
