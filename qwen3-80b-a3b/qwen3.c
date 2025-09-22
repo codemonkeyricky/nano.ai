@@ -1022,6 +1022,13 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         float *v_i = (float *)r->layers[layer].value[chunk].attn;
         subtract_f32((float *)v_new, v_i, (float *)v_prime, 32 * 64 * 128);
 
+        /*
+         * attn_inter = (q_i * g[:, :, i, :, None].exp()) @last_recurrent_state
+         *
+         * q_i -> 32x1x128
+         * g.exp -> 32
+         */
+
         volatile int dummy = 0;
     }
 
