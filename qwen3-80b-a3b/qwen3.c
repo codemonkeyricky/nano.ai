@@ -994,9 +994,9 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
         for (int pp = 0; pp <= offset; ++pp) {
             for (int h = 0; h < 32; ++h) {
-                float *q = r->layers[layer].query->attn[h];
-                float *k = (float *)r->layers[layer].k_cache[chunk].attn[h][pp];
-                float *attn = (float *)r->layers[layer].attn_cache2->attn[h][pp];
+                float *q = r->layers[layer].query->attn[h];                        /* 1x1x128 */
+                float *k = (float *)r->layers[layer].k_cache[chunk].attn[h];       /* 1x64x128 */
+                float *attn = (float *)r->layers[layer].attn_cache2->attn[h][pos]; /* 1x64 */
                 matmul_f32(attn, q, k, 128, 64);
 
                 /* TODO: decay_mask */
