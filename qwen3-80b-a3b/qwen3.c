@@ -100,7 +100,7 @@ struct RecurrentState {
 struct RLayer {
     // Head *key;
     // Head *value;
-    struct AttentionChunk *attn_cache2;
+    // struct AttentionChunk *attn_cache2;
     struct Projection *query;
     struct AttentionChunk *attn_cache;
     struct ProjectionChunk *k_cache;
@@ -988,20 +988,24 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         volatile int dummy = 0;
     }
 
+    int chunk = pos / 64;
+    int offset = pos % 64;
+    int chunks = ((pos + 1) + 63) / 64;
+
     struct RecurrentState emptyRecurrentState = {};
     *r->layers[layer].last_recurrent_state = emptyRecurrentState;
 
     struct ProjectionChunk project_chunk_zeroes = {};
-    *r->layers[layer].core_attn_out = project_chunk_zeroes;
+    r->layers[layer].core_attn_out[chunk] = project_chunk_zeroes;
 
-    int chunks = ((pos + 1) + 63) / 64;
-    for (int chunk = 0; chunk < chunks; ++chunk) {
+    /*for (int chunk = 0; chunk < chunks; ++chunk)*/ {
 
         /* attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0) */
+        float attention[32][64] = {}; /* attention for current token only */
         for (int h = 0; h < 32; ++h) {
-            float *q = r->layers[layer].query->attn[h];                        /* 1x1x128 */
-            float *k = (float *)r->layers[layer].k_cache[chunk].attn[h];       /* 1x64x128 */
-            float *attn = (float *)r->layers[layer].attn_cache2->attn[h][pos]; /* 1x64 */
+            float *q = r->layers[layer].query->attn[h];                  /* 1x1x128 */
+            float *k = (float *)r->layers[layer].k_cache[chunk].attn[h]; /* 1x64x128 */
+            float *attn = attention[h];                                  /* 1x64 */
             matmul_f32(attn, q, k, 128, 64);
             mul_f32(attn, attn, r->layers[layer].decay_mask[chunk].attn[h][pp], 64);
         }
@@ -1029,7 +1033,35 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
          * g.exp -> 32
          */
 
-        volatile int dummy = 0;
+        float attn_inter[32][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            float *q = r->layers[layer].query->attn[h]; /* 1x1x128 */
+            float g = r->layers[layer].g->decay[h][pos];
+            for (int j = 0; j < 128; ++j) {
+                attn_inter[h][j] *= expf(g);
+            }
+
+            float tmp[128][128] = {};
+            float *recurrent = (float *)r->layers[layer].last_recurrent_state[chunk].decay; /* 128x128 */
+            transpose((float *)tmp, recurrent, 128, 128);
+            matmul_f32(attn_inter[h], attn_inter[h], (float *)tmp, 128, 1);
+
+            volatile int dummy = 0;
+        }
+
+        /* core_attn_out[:, :, i] = attn_inter + attn @ v_new */
+        for (int h = 0; h < 32; ++h) {
+            float *attn = attention[h]; /* 1x64 */
+            float v_new_transposed[128][64] = {};
+            float tmp[128] = {};
+            transpose((float *)v_new_transposed, (float *)v_new[h], 64, 128);
+            matmul_f32(tmp, attn, (float *)v_new_transposed, 64, 128); /* 1x64 @ 64@128 = 1x128*/
+
+            float *core_attn_out = (float *)r->layers[layer].core_attn_out[chunk].attn[h][offset];
+            for (int j = 0; j < 128; ++j) {
+                core_attn_out[j] = attn_inter[h][j] + tmp[j] /* since attn is 1x1 */;
+            }
+        }
     }
 
     /* Note: remember transformers code someimes track things transposed ... */
@@ -1150,7 +1182,7 @@ void runtime_init(struct Transformer *xfmr) {
         r->layers[i].decay_mask = (struct AttentionChunk *)calloc(chunks, sizeof(struct AttentionChunk));
 
         r->layers[i].attn_cache = (struct AttentionChunk *)calloc(chunks, sizeof(struct AttentionChunk));
-        r->layers[i].attn_cache2 = (struct AttentionChunk *)calloc(chunks, sizeof(struct AttentionChunk));
+        // r->layers[i].attn_cache2 = (struct AttentionChunk *)calloc(chunks, sizeof(struct AttentionChunk));
     }
 }
 
