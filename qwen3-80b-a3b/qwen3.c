@@ -820,7 +820,6 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
     float q[4096] = {}, k[4096] = {}, v[4096] = {};
     for (int i = 0; i < 4096; ++i) {
-        q[i] = query[i % 2048];
         v[i] = value[i];
     }
 
@@ -829,6 +828,8 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
             int k1 = (h * 2 + 0) * 128 + i;
             int k2 = (h * 2 + 1) * 128 + i;
             k[k1] = k[k2] = key[h * 128 + i];
+
+            q[k1] = q[k2] = query[h * 128 + i];
         }
     }
 
@@ -836,8 +837,9 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     int offset = pos % 64;
 
     for (int h = 0; h < 32; ++h) {
-        float *query = (float *)r->layers[layer].query[h].attn;
-        memcpy(query, q + h * 128, sizeof(float) * 128);
+        struct Projection *qq = r->layers[layer].query;
+        memcpy((float *)qq->attn[h], q + h * 128, sizeof(float) * 128);
+        volatile int dummy = 0;
     }
 
     /* insert into key cache, head by head */
@@ -988,8 +990,8 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         volatile int dummy = 0;
     }
 
-    int chunk = pos / 64;
-    int offset = pos % 64;
+    // int chunk = pos / 64;
+    // int offset = pos % 64;
     int chunks = ((pos + 1) + 63) / 64;
 
     struct RecurrentState emptyRecurrentState = {};
@@ -1068,6 +1070,12 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
          *   + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new */
     }
 
+    for (int h = 0; h < 32; ++h) {
+        float *core = (float *)r->layers[layer].core_attn_out[chunk].attn[h][offset];
+        for (int j = 0; j < 128; ++j) {
+            xout[h * 128 + j] = (__bf16)core[j];
+        }
+    }
     volatile int dummy = 0;
 }
 
@@ -1130,7 +1138,7 @@ void runtime_init(struct Transformer *xfmr) {
         r->layers[i].k_beta_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
         r->layers[i].k_beta_exp_cache = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
         r->layers[i].value = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
-        r->layers[i].query = (struct Projection *)calloc(chunks, sizeof(struct Projection));
+        r->layers[i].query = (struct Projection *)aligned_malloc(1, sizeof(struct Projection));
 
         r->layers[i].k_cumdecay = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
 
@@ -1273,6 +1281,7 @@ int main() {
             if (m->layers[k].q_proj_w) {
                 self_attention(embeddings, embeddings2, x, k, pos, sin, cos);
             } else {
+                /* core_attn_out is 32x128, and we allocated 16x256 ... */
                 linear_attention(embeddings, embeddings2, x, k, pos, sin, cos);
             }
 
