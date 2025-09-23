@@ -59,6 +59,7 @@ struct Layer {
     const __bf16 *linear_attn_conv1d_w;
     const __bf16 *linear_attn_dt_b;
     const __bf16 *linear_attn_a_log;
+    const __bf16 *linear_attn_norm;
     struct Expert *experts;
 };
 
@@ -245,6 +246,7 @@ void mmap_layer(struct Transformer *x, int layer) {
         {"weights/layer_%d_linear_attn_conv1d_w.bin", &l->linear_attn_conv1d_w},
         {"weights/layer_%d_linear_attn_dt_b.bin", &l->linear_attn_dt_b},
         {"weights/layer_%d_linear_attn_a_log.bin", &l->linear_attn_a_log},
+        {"weights/layer_%d_linear_attn_norm.bin", &l->linear_attn_norm},
         {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
     };
 
@@ -711,6 +713,52 @@ float softplus(float x) {
 
 __bf16 mixed_qkv[4][8192] = {};
 
+void rmsnorm_gated(__bf16 *xout, __bf16 *tmp, __bf16 *zz, __bf16 *w, int n_heads, int head_dim) {
+    const float variance_epsilon = 1e-6f;
+
+    float hidden[n_heads * head_dim] = {};
+    float gate[n_heads * head_dim] = {};
+
+    // Convert bfloat16 to float for computation
+    for (int i = 0; i < n_heads * head_dim; i++) {
+        hidden[i] = tmp[i];
+        gate[i] = zz[i];
+    }
+
+    // Calculate variance per head (across head_dim dimension)
+    for (int head = 0; head < n_heads; head++) {
+        int start_idx = head * head_dim;
+
+        // Calculate variance for this head
+        float variance = 0.0f;
+        for (int i = start_idx; i < start_idx + head_dim; i++) {
+            variance += hidden[i] * hidden[i];
+        }
+        variance /= head_dim;
+
+        // Calculate reciprocal square root for this head
+        float rsqrt_val = 1.0f / sqrtf(variance + variance_epsilon);
+
+        // Apply normalization and gate for this head
+        for (int i = start_idx, j = 0; i < start_idx + head_dim; ++i, ++j) {
+            // Normalize
+            hidden[i] = hidden[i] * rsqrt_val;
+
+            /* TODO: multiply weight */
+            hidden[i] *= w[j];
+
+            // Apply gate with SiLU activation: x * sigmoid(x)
+            float sigmoid_gate = 1.0f / (1.0f + expf(-gate[i]));
+            hidden[i] = hidden[i] * (gate[i] * sigmoid_gate); // SiLU: gate * sigmoid(gate)
+        }
+    }
+
+    // Convert back to bfloat16
+    for (int i = 0; i < n_heads * head_dim; i++) {
+        xout[i] = hidden[i];
+    }
+}
+
 void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
                       const int pos, __bf16 *sin, __bf16 *cos) {
     const struct Config *c = &xfmr->config;
@@ -1070,12 +1118,21 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
          *   + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new */
     }
 
+    __bf16 tmp[32 * 128] = {};
     for (int h = 0; h < 32; ++h) {
         float *core = (float *)r->layers[layer].core_attn_out[chunk].attn[h][offset];
         for (int j = 0; j < 128; ++j) {
-            xout[h * 128 + j] = (__bf16)core[j];
+            tmp[h * 128 + j] = (__bf16)core[j];
         }
     }
+
+    __bf16 zz[32 * 128] = {};
+    for (int h = 0; h < 16; ++h) {
+        memcpy(&zz[h * 256], qkvz->head[h].z, 256 * sizeof(__bf16));
+    }
+
+    rmsnorm_gated(xout, tmp, zz, m->layers[layer].linear_attn_norm, 32, 128);
+
     volatile int dummy = 0;
 }
 
