@@ -1062,49 +1062,11 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
                 core_attn_out[j] = attn_inter[h][j] + tmp[j] /* since attn is 1x1 */;
             }
         }
+
+        /* last_recurrent_state = (
+         *   last_recurrent_state * g[:, :, i, -1, None, None].exp()
+         *   + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new */
     }
-
-    /* Note: remember transformers code someimes track things transposed ... */
-
-    /*
-     * attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-     *
-     * Run current k_beta against all previous keys
-     *
-     * (k_beta @ key.transpose(-1, -2))[0][h][0][0][:16]
-     * heads is the 2nd column
-     */
-    // float attn[32][64] = {};
-    // for (int h = 0; h < 32; ++h) {
-    //     for (int p = 0; p <= pos; ++p) {
-    //         float *key = r->layers[layer].key[h].cache + pos * 128;
-    //         matmul_f32(&attn[h][p], k_beta + h * 128, key, 128, 1);
-    //     }
-    // }
-
-    // /* TODO: hack for now */
-    // for (int i = 0; i < 32; ++i) {
-    //     attn[i][pos] = 1;
-    // }
-
-    // float v_beta2[32][64][128] = {};
-    // float value2[32][64][128] = {};
-
-    /*
-     * calculate attention attenuated value
-     */
-    // for (int h = 0; h < 32; ++h) {
-    //     for (int d = 0; d < 128; ++d) {
-    //         for (int j = 0; j <= pos; ++j) {
-    //             value2[h][pos][d] += attn[h][j] * value2[h][j][d];
-    //         }
-    //     }
-    // }
-
-    /*
-     * g represents accumulates every token
-     * decay_mask is re-calculated every token, since older tokens decay more
-     */
 
     volatile int dummy = 0;
 }
