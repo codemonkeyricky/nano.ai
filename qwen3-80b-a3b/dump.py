@@ -89,6 +89,7 @@ def main():
 
     # Dump weights for all layers
     for i in range(model.config.num_hidden_layers):
+        print("Dumping layer #", i)
 
         # Dump model.model.layers[i].mlp.gate weights
         if hasattr(model.model.layers[i].mlp, "gate"):
