@@ -129,6 +129,9 @@ def main():
             with open(f"weights/layer_{i}_linear_attn_norm.bin", "wb") as f:
                 w = attn.norm.weight.detach().cpu().view(torch.int16).numpy()
                 w.tofile(f)
+            with open(f"weights/layer_{i}_linear_out_proj.bin", "wb") as f:
+                w = attn.out_proj.weight.detach().cpu().view(torch.int16).numpy()
+                w.tofile(f)
 
         # self_attn weights and biases
         if hasattr(model.model.layers[i], "self_attn"):
