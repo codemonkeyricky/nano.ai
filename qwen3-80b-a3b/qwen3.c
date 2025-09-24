@@ -281,12 +281,10 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
     for (int i = 0; i < config->n_layers; i++) {
         mmap_layer((struct Transformer *)config, i);
 
-#if 0
-        mmapping->layers[i].experts = (struct Expert *)malloc(sizeof(struct Expert) * 128);
-        for (auto int ex = 0; ex < 128; ++ex) {
+        mmapping->layers[i].experts = (struct Expert *)malloc(sizeof(struct Expert) * 512);
+        for (auto int ex = 0; ex < 512; ++ex) {
             mmap_layer_expert((struct Transformer *)config, i, ex);
         }
-#endif
     }
 
 #if 0
@@ -1385,6 +1383,8 @@ int main() {
                 /* down */
                 matmul(experts[kk], mlp_embeddings, m->layers[k].experts[ex].down_proj, c->moe_intermediate_size,
                        c->hidden_size);
+
+                volatile int dummy = 0;
             }
 
             float top_scores[c->num_experts_per_token] = {};
@@ -1399,6 +1399,8 @@ int main() {
                     combined[kk] += (__bf16)(top_scores[k] * (float)experts[k][kk]);
                 }
             }
+
+            /* TODO: shared expert */
 
             add(embeddings, combined, skip, c->hidden_size);
         }

@@ -156,18 +156,30 @@ def main():
                 o.tofile(f)
 
         # # Dump all experts: gate, up, down proj
-        # if hasattr(model.model.layers[i].mlp, "experts"):
-        #     experts = model.model.layers[i].mlp.experts
-        #     for expert_idx, expert in enumerate(experts):
-        #         gate_proj = expert.gate_proj.weight.detach().cpu().view(torch.int16).numpy()
-        #         with open(f"weights/layer_{i}_expert_{expert_idx}_gate_proj.bin", "wb") as f:
-        #             gate_proj.tofile(f)
-        #         up_proj = expert.up_proj.weight.detach().cpu().view(torch.int16).numpy()
-        #         with open(f"weights/layer_{i}_expert_{expert_idx}_up_proj.bin", "wb") as f:
-        #             up_proj.tofile(f)
-        #         down_proj = expert.down_proj.weight.detach().cpu().view(torch.int16).numpy()
-        #         with open(f"weights/layer_{i}_expert_{expert_idx}_down_proj.bin", "wb") as f:
-        #             down_proj.tofile(f)
+        if hasattr(model.model.layers[i].mlp, "experts"):
+            shared = model.model.layers[0].mlp.shared_expert
+            gate_proj = shared.gate_proj.weight.detach().cpu().view(torch.int16).numpy()
+            with open(f"weights/layer_{i}_shared_expert_gate_proj.bin", "wb") as f:
+                gate_proj.tofile(f)
+            up_proj = shared.up_proj.weight.detach().cpu().view(torch.int16).numpy()
+            with open(f"weights/layer_{i}_shared_expert_up_proj.bin", "wb") as f:
+                up_proj.tofile(f)
+            down_proj = shared.down_proj.weight.detach().cpu().view(torch.int16).numpy()
+            with open(f"weights/layer_{i}_shared_expert_down_proj.bin", "wb") as f:
+                down_proj.tofile(f)
+
+            experts = model.model.layers[i].mlp.experts
+            for expert_idx, expert in enumerate(experts):
+                gate_proj = expert.gate_proj.weight.detach().cpu().view(torch.int16).numpy()
+                with open(f"weights/layer_{i}_expert_{expert_idx}_gate_proj.bin", "wb") as f:
+                    gate_proj.tofile(f)
+                up_proj = expert.up_proj.weight.detach().cpu().view(torch.int16).numpy()
+                with open(f"weights/layer_{i}_expert_{expert_idx}_up_proj.bin", "wb") as f:
+                    up_proj.tofile(f)
+                down_proj = expert.down_proj.weight.detach().cpu().view(torch.int16).numpy()
+                with open(f"weights/layer_{i}_expert_{expert_idx}_down_proj.bin", "wb") as f:
+                    down_proj.tofile(f)
+
         # else:
         #     # Fallback: dump gate_proj, up_proj, down_proj from mlp itself (single expert)
         #     mlp = model.model.layers[i].mlp
