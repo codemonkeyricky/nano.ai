@@ -1134,8 +1134,9 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     }
 
     rmsnorm_gated(xout, tmp, zz, m->layers[layer].linear_attn_norm, 32, 128);
+    memcpy(tmp, xout, 32 * 128 * sizeof(__bf16));
 
-    volatile int dummy = 0;
+    matmul(xout, tmp, m->layers[layer].linear_attn_out_proj_w, 4096, c->hidden_size);
 }
 
 void *aligned_malloc(size_t alignment, size_t size) {
