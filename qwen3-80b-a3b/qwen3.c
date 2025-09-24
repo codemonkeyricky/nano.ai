@@ -60,6 +60,7 @@ struct Layer {
     const __bf16 *linear_attn_dt_b;
     const __bf16 *linear_attn_a_log;
     const __bf16 *linear_attn_norm;
+    const __bf16 *linear_attn_out_proj;
     struct Expert *experts;
 };
 
@@ -247,6 +248,7 @@ void mmap_layer(struct Transformer *x, int layer) {
         {"weights/layer_%d_linear_attn_dt_b.bin", &l->linear_attn_dt_b},
         {"weights/layer_%d_linear_attn_a_log.bin", &l->linear_attn_a_log},
         {"weights/layer_%d_linear_attn_norm.bin", &l->linear_attn_norm},
+        {"weights/layer_%d_linear_attn_out_proj.bin", &l->linear_attn_out_proj},
         {"weights/layer_%d_post_attention_layernorm.bin", &l->post_attn_layernorm},
     };
 
