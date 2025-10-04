@@ -117,7 +117,7 @@ struct RLayer {
     Head *value_cache;
 
     /* linear attention */
-    __bf16 mixed_qkv_raw[4][8192];
+    __bf16 mixed_qkv_raw[64][8192];
     struct Projection *query;
     struct AttentionChunk *attn_cache;
     struct ProjectionChunk *k_cache;
@@ -1009,7 +1009,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
     const struct Mmapping *m = &xfmr->mmapping;
     // int pp = pos % 4;
 
-    __bf16 (*qkvz)[64][4096] = (__bf16 (*)[64][4096])r->qkvz;
+    __bf16 (*qkvz)[64][12288] = (__bf16 (*)[64][12288])r->qkvz;
     __bf16 (*ba)[64][64] = (__bf16 (*)[64][64])r->ba;
 
     /* qkvz and ba projection */
@@ -1021,34 +1021,34 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         matmul((*ba)[i], x[i], m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
     }
 
-    volatile int dummy = 0;
-
-#if 0
-    struct projected_qkvz *qkvz = (struct projected_qkvz *)r->qkvz[pp];
-    __bf16 *debug = (__bf16 *)qkvz;
-
     /* Convert from interleaved to concatenated format */
 
-    __bf16 (*mixed_qkv_raw)[8192] = r->layers[layer].mixed_qkv_raw;
+    __bf16 (*raw)[8192] = r->layers[layer].mixed_qkv_raw;
 
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 128; j++) {
-            mixed_qkv_raw[pp][0 + i * 128 + j] = qkvz->head[i].q[j];
+    for (int k = 0; k < n; ++k) {
+
+        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)(*qkvz)[k];
+
+        for (int i = 0; i < 16; i++) {
+            for (int j = 0; j < 128; j++) {
+                raw[k][0 + i * 128 + j] = p_qkvz->head[i].q[j];
+            }
         }
-    }
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 128; j++) {
-            mixed_qkv_raw[pp][2048 + i * 128 + j] = qkvz->head[i].k[j];
+        for (int i = 0; i < 16; i++) {
+            for (int j = 0; j < 128; j++) {
+                raw[k][2048 + i * 128 + j] = p_qkvz->head[i].k[j];
+            }
         }
-    }
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 256; j++) {
-            mixed_qkv_raw[pp][4096 + i * 256 + j] = qkvz->head[i].v[j];
+        for (int i = 0; i < 16; i++) {
+            for (int j = 0; j < 256; j++) {
+                raw[k][4096 + i * 256 + j] = p_qkvz->head[i].v[j];
+            }
         }
     }
 
     /* TODO: save most recent 4 mixed_qkv[pp] for next iterations */
 
+#if 0
     /* conv1d over qkv - 8192 dimensions */
     struct conv1d_w *w = (struct conv1d_w *)m->layers[layer].linear_attn_conv1d_w;
     for (int i = 0; i < 8192; i++) {
