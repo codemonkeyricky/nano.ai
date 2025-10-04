@@ -1062,10 +1062,13 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     }
 
-#if 0
-    /* silu on all 8192 elements */
-    silu_array(mixed_qkv[pp], mixed_qkv[pp], 8192);
+    for (int pp = 0; pp < n; ++pp) {
+        /* silu on all 8192 elements */
+        silu_array(mixed[pp], mixed[pp], 8192);
+    }
 
+    volatile int dummy = 0;
+#if 0
     struct projected_ba *ba = (struct projected_ba *)r->ba;
     __bf16 beta_bf16[32] = {};
     for (int i = 0; i < 16; ++i) {
