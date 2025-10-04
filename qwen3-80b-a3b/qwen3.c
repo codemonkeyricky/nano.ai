@@ -1125,31 +1125,49 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         for (int i = 0; i < 2048; i += 128) {
             l2norm_forward(key + i, key + i, 128);
         }
-        volatile int dummy = 0;
     }
 
-#if 0
     /*
      * Expand q and k to 32 heads
      * Convert qkv floats
      */
 
-    float q[4096] = {}, k[4096] = {}, v[4096] = {};
-    for (int i = 0; i < 4096; ++i) {
-        v[i] = value[i];
-    }
+    float q[64][4096] = {}, k[64][4096] = {}, v[64][4096] = {};
+    for (int p = 0; p < n; ++p) {
 
-    float scale = 1.0f / sqrtf(128);
-    for (int h = 0; h < 16; ++h) {
-        for (int i = 0; i < 128; ++i) {
-            int k1 = (h * 2 + 0) * 128 + i;
-            int k2 = (h * 2 + 1) * 128 + i;
-            k[k1] = k[k2] = key[h * 128 + i];
-            /* scale query */
-            q[k1] = q[k2] = scale * (float)query[h * 128 + i];
+        __bf16 *query, *key, *value;
+        query = mixed[p] + 0;
+        key = mixed[p] + 2048;
+        value = mixed[p] + 4096;
+
+        for (int i = 0; i < 4096; ++i) {
+            v[p][i] = value[i];
+        }
+
+        float scale = 1.0f / sqrtf(128);
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < 128; ++i) {
+                int k1 = (h * 2 + 0) * 128 + i;
+                int k2 = (h * 2 + 1) * 128 + i;
+                k[p][k1] = k[p][k2] = key[h * 128 + i];
+                q[p][k1] = q[p][k2] = scale * (float)query[h * 128 + i]; /* scale query */
+            }
         }
     }
 
+    float v_beta[64][32][128] = {};
+    float k_beta[64][32][128] = {};
+    for (int p = 0; p < n; ++p) {
+        for (int h = 0; h < 32; ++h) {
+            for (int j = 0; j < 128; ++j) {
+                v_beta[p][h][j] = v[p][h * 128 + j] * beta[p][h];
+                k_beta[p][h][j] = k[p][h * 128 + j] * beta[p][h];
+            }
+        }
+    }
+
+    volatile int dummy = 0;
+#if 0
     int chunk = pos / 64;
     int offset = pos % 64;
 
