@@ -1008,15 +1008,16 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
     // int pp = pos % 4;
 
     __bf16 (*qkvz)[64][12288] = (__bf16 (*)[64][12288])r->qkvz;
-    __bf16 (*ba)[64][64] = (__bf16 (*)[64][64])r->ba;
+    __bf16 (*ba)[16][4] = (__bf16 (*)[16][4])r->ba;
 
     /* qkvz and ba projection */
     for (int i = 0; i < n; ++i) {
         matmul((*qkvz)[i], x[i], m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
     }
 
+    /* ba is 64x(16x2x2) */
     for (int i = 0; i < n; ++i) {
-        matmul((*ba)[i], x[i], m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
+        matmul((__bf16 *)ba[i], x[i], m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
     }
 
     /* Convert from interleaved to concatenated format */
@@ -1067,41 +1068,49 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         silu_array(mixed[pp], mixed[pp], 8192);
     }
 
+    float beta[64][32] = {};
+    for (int k = 0; k < 64; ++k) {
+        for (int i = 0; i < 16; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                beta[k][i * 2 + j] = sigmoid(ba[k][i][0 + j]);
+            }
+        }
+    }
+
+    float a[64][32] = {};
+    for (int k = 0; k < 64; ++k) {
+        for (int i = 0; i < 16; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                a[k][i * 2 + j] = ba[k][i][2 + j];
+            }
+        }
+    }
+
+    for (int k = 0; k < 64; ++k) {
+        for (int i = 0; i < 32; ++i) {
+            a[k][i] = a[k][i] + (float)m->layers[layer].linear_attn_dt_b[i];
+        }
+        for (int i = 0; i < 32; ++i) {
+            a[k][i] = softplus(a[k][i]);
+        }
+    }
+
+    float nalogexp[64][32] = {};
+    for (int k = 0; k < 64; ++k) {
+        for (int i = 0; i < 32; ++i) {
+            nalogexp[k][i] = -expf((float)m->layers[layer].linear_attn_a_log[i]);
+        }
+    }
+
+    float g[64][32] = {};
+    for (int k = 0; k < 64; ++k) {
+        for (int i = 0; i < 32; ++i) {
+            g[k][i] = nalogexp[k][i] * a[k][i];
+        }
+    }
+
     volatile int dummy = 0;
 #if 0
-    struct projected_ba *ba = (struct projected_ba *)r->ba;
-    __bf16 beta_bf16[32] = {};
-    for (int i = 0; i < 16; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            beta_bf16[i * 2 + j] = sigmoid(ba->ba[i].b[j]);
-        }
-    }
-
-    float a[32] = {};
-    for (int i = 0; i < 16; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            a[i * 2 + j] = ba->ba[i].a[j];
-        }
-    }
-
-    for (int i = 0; i < 32; ++i) {
-        a[i] = a[i] + (float)m->layers[layer].linear_attn_dt_b[i];
-    }
-
-    for (int i = 0; i < 32; ++i) {
-        a[i] = softplus(a[i]);
-    }
-
-    float nalogexp[32] = {};
-    for (int i = 0; i < 32; ++i) {
-        nalogexp[i] = -expf((float)m->layers[layer].linear_attn_a_log[i]);
-    }
-
-    float g[32] = {};
-    for (int i = 0; i < 32; ++i) {
-        g[i] = nalogexp[i] * a[i];
-    }
-
     float beta[32] = {};
     for (int i = 0; i < 32; ++i) {
         beta[i] = beta_bf16[i];
