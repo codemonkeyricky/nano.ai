@@ -1102,10 +1102,10 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     }
 
-    float g[64][32] = {};
-    for (int k = 0; k < 64; ++k) {
-        for (int i = 0; i < 32; ++i) {
-            g[k][i] = nalogexp[k][i] * a[k][i];
+    float g[32][64] = {};
+    for (int h = 0; h < 32; ++h) {
+        for (int k = 0; k < n; ++k) {
+            g[h][k] = nalogexp[k][h] * a[k][h];
         }
     }
 
@@ -1166,68 +1166,14 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     }
 
-    volatile int dummy = 0;
-#if 0
-    int chunk = pos / 64;
-    int offset = pos % 64;
-
-    for (int h = 0; h < 32; ++h) {
-        struct Projection *qq = r->layers[layer].query;
-        memcpy((float *)qq->attn[h], q + h * 128, sizeof(float) * 128);
-        volatile int dummy = 0;
-    }
-
-    /* insert into key cache, head by head */
-    for (int h = 0; h < 32; ++h) {
-        float *k_cache = r->layers[layer].k_cache[chunk].attn[h][offset];
-        float *key = k + h * 128;
-        memcpy(k_cache, key, sizeof(float) * 128);
-    }
-
-    for (int h = 0; h < 32; ++h) {
-        float *v_cache = r->layers[layer].v_cache[chunk].attn[h][offset];
-        float *value = v + h * 128;
-        memcpy(v_cache, value, sizeof(float) * 128);
-    }
-
-    /*
-     * ==========================================================
-     */
-
-    /*
-     * v_beta = value * beta.unsqueeze(-1)
-     * k_beta = key * beta.unsqueeze(-1)
-     *
-     * k_beta and v_beta are both 32 x 128
-     */
-
-    for (int h = 0; h < 32; ++h) {
-        float *v = r->layers[layer].v_cache[chunk].attn[h][offset];
-        float *k = r->layers[layer].k_cache[chunk].attn[h][offset];
-        float *vb = r->layers[layer].v_beta_cache[chunk].attn[h][offset];
-        float *kb = r->layers[layer].k_beta_cache[chunk].attn[h][offset];
-        for (int j = 0; j < 128; ++j) {
-            vb[j] = v[j] * beta[h];
-            kb[j] = k[j] * beta[h];
-        }
-    }
-
-    struct ProjectionChunk *v_beta = r->layers[layer].v_beta_cache;
-    struct ProjectionChunk *k_beta = r->layers[layer].k_beta_cache;
-
     /*
      * g = g.cumsum(dim=-1)
      * g is cumulative sum of decay factors
      */
+    /* float g[32][64] = {}; */
     for (int h = 0; h < 32; ++h) {
-        r->layers[layer].g->decay[h][pos] = g[h];
-        if (pos) {
-            r->layers[layer].g->decay[h][pos] += r->layers[layer].g->decay[h][pos - 1];
-        }
-
-        /* fill in the rest with the last value */
-        for (int j = pos + 1; j < 64; ++j) {
-            r->layers[layer].g->decay[h][j] = r->layers[layer].g->decay[h][pos];
+        for (int i = 1; i < 64; ++i) {
+            g[h][i] += g[h][i - 1];
         }
     }
 
@@ -1236,23 +1182,19 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
         /*
          * decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-         *
-         * The transforrmers code generates decay for all pairs of indices, then
-         * apply a trianglar mask to remove the invalid ones (eg. current only
-         * decays into the past). The python code creates the matrix for all
-         * tokens, for decoding we only need one row.
-         *
-         * While g can be re-used, decay_mask needs to be re-calculated as current
-         * moves forward.
          */
+        float decay_mask[32][64][64] = {};
         for (int h = 0; h < 32; ++h) {
-            float *decay_mask = r->layers[layer].decay_mask[chunk].attn[h][pos];
-            float (*g)[64] = r->layers[layer].g->decay;
-            for (int i = 0; i <= pos; ++i) {
-                decay_mask[i] = expf(g[h][pos] - g[h][i]);
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j <= i; ++j) {
+                    decay_mask[h][i][j] = expf(g[h][i] - g[h][j]);
+                }
             }
         }
 
+        volatile int dummy = 0;
+
+#if 0
         /*
          *  mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
          *  attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
@@ -1480,7 +1422,10 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
                            128); /* 1x128 */
             }
         }
-    } else {
+#endif
+    }
+#if 0
+     else {
         /* recurrent gated delta rule */
         recurrent_gated_delta_rule(g, beta, layer, pos, xfmr);
     }
