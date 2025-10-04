@@ -1109,35 +1109,26 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     }
 
-    volatile int dummy = 0;
-#if 0
-    float beta[32] = {};
-    for (int i = 0; i < 32; ++i) {
-        beta[i] = beta_bf16[i];
-    }
+    for (int k = 0; k < n; ++k) {
 
-    /* v shaped as 32 heads x 128 dim */
-    for (int i = 0; i < 32; i++) {
-        for (int j = 0; j < 128; j++) {
-            qkvz->head[i / 2].v[(i % 2 * 128) + j] *= beta[i];
+        __bf16 *query, *key, *value;
+        query = mixed[k] + 0;
+        key = mixed[k] + 2048;
+        value = mixed[k] + 4096;
+
+        /* query is normalized and scaled */
+        for (int i = 0; i < 2048; i += 128) {
+            l2norm_forward(query + i, query + i, 128);
         }
+
+        /* key is normalized not scaled */
+        for (int i = 0; i < 2048; i += 128) {
+            l2norm_forward(key + i, key + i, 128);
+        }
+        volatile int dummy = 0;
     }
 
-    __bf16 *query, *key, *value;
-    query = mixed_qkv[pp] + 0;
-    key = mixed_qkv[pp] + 2048;
-    value = mixed_qkv[pp] + 4096;
-
-    /* query is normalized and scaled */
-    for (int i = 0; i < 2048; i += 128) {
-        l2norm_forward(query + i, query + i, 128);
-    }
-
-    /* key is normalized not scaled */
-    for (int i = 0; i < 2048; i += 128) {
-        l2norm_forward(key + i, key + i, 128);
-    }
-
+#if 0
     /*
      * Expand q and k to 32 heads
      * Convert qkv floats
