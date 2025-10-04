@@ -117,7 +117,8 @@ struct RLayer {
     Head *value_cache;
 
     /* linear attention */
-    __bf16 mixed_qkv_raw[64][8192];
+    __bf16 mixed_qkv_raw[64 + 4][8192]; /* +4 for the convolution kernel size */
+    __bf16 mixed_qkv[64][8192];
     struct Projection *query;
     struct AttentionChunk *attn_cache;
     struct ProjectionChunk *k_cache;
@@ -845,9 +846,6 @@ float softplus(float x) {
     return log1pf(expf(x));
 }
 
-// __bf16 mixed_qkv_raw[4][8192] = {};
-__bf16 mixed_qkv[4][8192] = {};
-
 void rmsnorm_gated(__bf16 *xout, __bf16 *tmp, __bf16 *zz, __bf16 *w, int n_heads, int head_dim) {
     const float variance_epsilon = 1e-6f;
 
@@ -1048,19 +1046,23 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
     /* TODO: save most recent 4 mixed_qkv[pp] for next iterations */
 
-#if 0
+    __bf16 (*mixed)[8192] = r->layers[layer].mixed_qkv;
+
     /* conv1d over qkv - 8192 dimensions */
     struct conv1d_w *w = (struct conv1d_w *)m->layers[layer].linear_attn_conv1d_w;
-    for (int i = 0; i < 8192; i++) {
-        __bf16 tmp = 0;
-        for (int k = 0; k < 4; ++k) {
-            __bf16 c1 = mixed_qkv_raw[(pp + 1 + k) % 4][i];
-            __bf16 c2 = w[i].w[k];
-            tmp += c1 * c2;
+    for (int pp = 0; pp < n; ++pp) {
+        for (int i = 0; i < 8192; i++) {
+            __bf16 tmp = 0;
+            for (int k = 0; k < 4; ++k) {
+                __bf16 c1 = raw[(64 - 3 + pp + k) % 64][i]; /* use the zero padding at the end */
+                __bf16 c2 = w[i].w[k];
+                tmp += c1 * c2;
+            }
+            mixed[pp][i] = tmp;
         }
-        mixed_qkv[pp][i] = tmp;
     }
 
+#if 0
     /* silu on all 8192 elements */
     silu_array(mixed_qkv[pp], mixed_qkv[pp], 8192);
 
