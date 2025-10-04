@@ -145,7 +145,7 @@ struct Runtime {
     __bf16 *h1;
     __bf16 *h2;
     __bf16 *h3;
-    __bf16 *qkvz[4]; /* kernel_size */
+    __bf16 *qkvz;
     __bf16 *ba;
     float (*g)[32]; // (*g)[64];
 
@@ -240,6 +240,8 @@ void mmap_layer_expert(struct Transformer *x, int layer, int expert) {
         int file_size = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
         *lookup[i].mmap = (const __bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        assert(*lookup[i].mmap != MAP_FAILED);
+        mlock(*lookup[i].mmap, file_size);
         close(fd);
     }
 }
@@ -270,6 +272,8 @@ void mmap_layer_shared_expert(struct Transformer *x, int layer) {
         int file_size = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
         *lookup[i].mmap = (const __bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        assert(*lookup[i].mmap != MAP_FAILED);
+        mlock(*lookup[i].mmap, file_size);
         close(fd);
     }
 }
@@ -310,10 +314,11 @@ void mmap_layer(struct Transformer *x, int layer) {
 
         int fd = open(path, O_RDONLY);
         if (fd > -1) {
-            /* self and linear attention are mutually exclusive */
             int file_size = lseek(fd, 0, SEEK_END);
             lseek(fd, 0, SEEK_SET);
             *lookup[i].mmap = (const __bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            assert(*lookup[i].mmap != MAP_FAILED);
+            mlock(*lookup[i].mmap, file_size);
             close(fd);
         }
     }
@@ -325,6 +330,8 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
     int file_size = lseek(fd, 0, SEEK_END);
     lseek(fd, 0, SEEK_SET);
     mmapping->embeddings = (__bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    assert(mmapping->embeddings != MAP_FAILED);
+    mlock(mmapping->embeddings, file_size);
     close(fd);
 
     mmapping->layers = (struct Layer *)calloc(1, sizeof(struct Layer) * config->n_layers);
@@ -346,6 +353,8 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
     file_size = lseek(fd, 0, SEEK_END);
     lseek(fd, 0, SEEK_SET);
     mmapping->final_layernorm = (__bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    assert(mmapping->final_layernorm != MAP_FAILED);
+    mlock(mmapping->final_layernorm, file_size);
     close(fd);
 
     fd = open("weights/lm_head.bin", O_RDONLY);
@@ -353,6 +362,8 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
         file_size = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
         mmapping->lm_head = (__bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        assert(mmapping->lm_head != MAP_FAILED);
+        mlock(mmapping->lm_head, file_size);
         close(fd);
     }
 }
@@ -430,7 +441,7 @@ void l2norm_forward(__bf16 *out, __bf16 *in, int dim) {
     }
 
     // Calculate reciprocal square root of (sum_squares + eps)
-    __bf16 rsqrt_val = 1.0f / sqrtf(sum_squares + eps);
+    __bf16 rsqrt_val = 1.0f / sqrtf(sum_squares + (__bf16)eps);
     for (int i = 0; i < dim; i++) {
         out[i] = in[i] * rsqrt_val;
     }
@@ -883,8 +894,8 @@ void rmsnorm_gated(__bf16 *xout, __bf16 *tmp, __bf16 *zz, __bf16 *w, int n_heads
     }
 }
 
-#pragma GCC push_options
-#pragma GCC optimize("O0")
+// #pragma GCC push_options
+// #pragma GCC optimize("O0")
 
 void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const struct Transformer *xfmr) {
     const struct Config *c = &xfmr->config;
@@ -987,23 +998,32 @@ void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const
             }
         }
     }
-
-    volatile int dummy = 0;
 }
 
-#pragma GCC pop_options
+// #pragma GCC pop_options
 
-void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
-                      const int pos, __bf16 *sin, __bf16 *cos, int prefill) {
+void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
+                      const int n, __bf16 sin[64][64], __bf16 cos[64][64], int prefill) {
     const struct Config *c = &xfmr->config;
     struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
-    int pp = pos % 4;
+    // int pp = pos % 4;
+
+    __bf16 (*qkvz)[64][4096] = (__bf16 (*)[64][4096])r->qkvz;
+    __bf16 (*ba)[64][64] = (__bf16 (*)[64][64])r->ba;
 
     /* qkvz and ba projection */
-    matmul(r->qkvz[pp], x, m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
-    matmul(r->ba, x, m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
+    for (int i = 0; i < n; ++i) {
+        matmul((*qkvz)[i], x[i], m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
+    }
 
+    for (int i = 0; i < n; ++i) {
+        matmul((*ba)[i], x[i], m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
+    }
+
+    volatile int dummy = 0;
+
+#if 0
     struct projected_qkvz *qkvz = (struct projected_qkvz *)r->qkvz[pp];
     __bf16 *debug = (__bf16 *)qkvz;
 
@@ -1341,7 +1361,7 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
         /* v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state */
         for (int h = 0; h < 32; ++h) {
             float *k_cumdecay = (float *)r->layers[layer].k_cumdecay[chunk].attn[h][offset]; /* 1x128 */
-            float *recurrent = (float *)r->layers[layer].last_recurrent_state->decay[h];  /* 128x128 */
+            float *recurrent = (float *)r->layers[layer].last_recurrent_state->decay[h];     /* 128x128 */
             float *v_prime = (float *)r->layers[layer].v_prime[chunk].attn[h][offset];       /* 1x128 */
             float tmp[128][128] = {};
             transpose((float *)tmp, recurrent, 128, 128);
@@ -1462,6 +1482,7 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
     memcpy(tmp, xout, 32 * 128 * sizeof(__bf16));
 
     matmul(xout, tmp, m->layers[layer].linear_attn_out_proj_w, 4096, c->hidden_size);
+#endif
 }
 
 void *aligned_malloc(size_t alignment, size_t size) {
@@ -1507,10 +1528,8 @@ void runtime_init(struct Transformer *xfmr) {
     r->h2 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 256);
     r->h3 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 256);
 
-    for (int i = 0; i < 4; ++i) {
-        r->qkvz[i] = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 12288);
-    }
-    r->ba = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 64);
+    r->qkvz = (__bf16 *)aligned_malloc(64, 64 * sizeof(__bf16) * 12288);
+    r->ba = (__bf16 *)aligned_malloc(64, 64 * sizeof(__bf16) * 64);
 
     r->layers = (struct RLayer *)calloc(sizeof(struct RLayer), c->n_layers);
 
@@ -1630,17 +1649,17 @@ int main() {
 
     int attn_hiddn_size = c->n_heads * c->head_dim;
 
-    __bf16 *skip = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
-    __bf16 *embeddings = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
-    __bf16 *embeddings2 = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
-    __bf16 *embeddings3 = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
-    __bf16 *embeddings4 = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
+    __bf16 (*skip)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
+    __bf16 (*emb)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
+    __bf16 (*emb2)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
+    __bf16 (*emb3)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
+    __bf16 (*emb4)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
 
-    __bf16 *mlp_embeddings = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
-    __bf16 *mlp_embeddings2 = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
-    __bf16 *mlp_embeddings3 = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
-    __bf16 *mlp_embeddings4 = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
-    __bf16 *expert_output = aligned_malloc(64, sizeof(__bf16) * c->hidden_size * c->num_experts);
+    __bf16 (*mlp_embeddings)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->intermediate_size);
+    __bf16 (*mlp_embeddings2)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->intermediate_size);
+    __bf16 (*mlp_embeddings3)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->intermediate_size);
+    __bf16 (*mlp_embeddings4)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->intermediate_size);
+    __bf16 (*expert_output)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size * c->num_experts);
 
     int stop_tokens[3] = {151645, 151644, 151643};
 
@@ -1659,33 +1678,45 @@ int main() {
     }
 #else
     int tokens[4096] = {151644, 872, 198, 285, 625, 1535, 264, 11580, 151645, 198, 151644, 77091, 198};
+    int prompt_len = 13;
 #endif
 
-    __bf16 cos[64] = {}, sin[64] = {};
+    __bf16 cos[64][64] = {}, sin[64][64] = {};
 
     clock_t start_time = clock(); // Start timing
 
     int pos = 0, prefill = 1;
     while (pos + 1 < c->max_position_embeddings) {
 
-        memcpy(embeddings, m->embeddings + tokens[pos] * c->hidden_size, c->hidden_size * sizeof(__bf16));
+        int n = prefill ? prompt_len : 1;
+        for (int i = 0; i < n; ++i) {
+            memcpy((*emb)[i], m->embeddings + tokens[pos + i] * c->hidden_size, c->hidden_size * sizeof(__bf16));
+        }
 
-        rope_forward(c, &c->d.rope, pos, cos, sin);
+        for (int i = 0; i < n; ++i) {
+            rope_forward(c, &c->d.rope, pos + i, cos[i], sin[i]);
+        }
 
         for (int k = 0; k < x->config.n_layers; k++) {
 
             /* save skip */
-            memcpy(skip, embeddings, c->hidden_size * sizeof(__bf16));
-
-            layernorm(embeddings2, embeddings, m->layers[k].input_layernorm, x);
-
-            if (m->layers[k].q_proj_w) {
-                self_attention(embeddings, embeddings2, x, k, pos, sin, cos);
-            } else {
-                /* core_attn_out is 32x128, and we allocated 16x256 ... */
-                linear_attention(embeddings, embeddings2, x, k, pos, sin, cos, prefill);
+            for (int i = 0; i < n; ++i) {
+                memcpy(skip, (*emb)[i], c->hidden_size * sizeof(__bf16));
             }
 
+            for (int i = 0; i < n; ++i) {
+                layernorm((*emb2)[i], (*emb)[i], m->layers[k].input_layernorm, x);
+            }
+
+            if (m->layers[k].q_proj_w) {
+#if 0
+                self_attention(embeddings, embeddings2, x, k, pos, sin, cos);
+#endif
+            } else {
+                /* core_attn_out is 32x128, and we allocated 16x256 ... */
+                linear_attention(*emb, *emb2, x, k, n, sin, cos, prefill);
+            }
+#if 0
             /* residual */
             add(embeddings2, embeddings, skip, c->hidden_size);
 
@@ -1781,8 +1812,10 @@ int main() {
             add(embeddings, embeddings2, skip, c->hidden_size);
 
             volatile int dummy = 0;
+#endif
         }
 
+#if 0
         layernorm(embeddings2, embeddings, m->final_layernorm, x);
 
         __bf16 logits[c->vocab_size] = {};
@@ -1812,6 +1845,7 @@ int main() {
 
         printf("%s", x->runtime.lookup[tokens[pos + 1]]);
         fflush(stdout);
+#endif
 
         ++pos;
     }
