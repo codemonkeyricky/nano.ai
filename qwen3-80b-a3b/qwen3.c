@@ -1759,7 +1759,7 @@ int main() {
             }
 #if 0
             /* residual */
-            add(embeddings2, embeddings, skip, c->hidden_size);
+            add(embeddings2, embeddings,skip, c->hidden_size);
 
             /* save skip */
             memcpy(skip, embeddings2, c->hidden_size * sizeof(__bf16));
