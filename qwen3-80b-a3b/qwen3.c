@@ -1192,9 +1192,6 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             }
         }
 
-        volatile int dummy = 0;
-
-#if 0
         /*
          *  mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
          *  attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
@@ -1207,17 +1204,86 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
          *  TODO: implement the above more efficient recurrent calculation
          */
 
+        /* tranpose head and seq_len */
+        static float qq[32][64][128] = {};
+        static float kk[32][64][128] = {};
+        static float vv[32][64][128] = {};
+        for (int i = 0; i < 64; ++i) {
+            for (int h = 0; h < 32; ++h) {
+                for (int j = 0; j < 128; ++j) {
+                    qq[h][i][j] = q[i][h * 128 + j];
+                    kk[h][i][j] = k[i][h * 128 + j];
+                    vv[h][i][j] = v[i][h * 128 + j];
+                }
+            }
+        }
+
+        static float kk_beta[32][64][128] = {};
         for (int h = 0; h < 32; ++h) {
-            float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h][offset];
-            float *k_beta = (float *)r->layers[layer].k_beta_cache[chunk].attn[h][offset];
-            float *k_cache = (float *)r->layers[layer].k_cache[chunk].attn[h];
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 128; ++j) {
+                    kk_beta[h][i][j] = kk[h][i][j] * beta[i][h];
+                }
+            }
+        }
+
+        float attn[32][64][64] = {};
+
+        for (int h = 0; h < 32; ++h) {
 
             /*
              * k_beta attending to all keys
              * deliberately stop before offset because upper right is masked out
              */
-            matmul_f32(attn, k_beta, k_cache, 128, offset);
+            for (int i = 0; i < 64; ++i) {
+                matmul_f32(attn[h][i], kk_beta[h][i], (float *)kk[h], 128, 64);
+            }
 
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 64; ++j) {
+                    attn[h][i][j] = -(attn[h][i][j] * decay_mask[h][i][j]);
+                }
+            }
+
+            for (int i = 0; i < 64; ++i) {
+                attn[h][i][i] = 0.0f;
+            }
+        }
+
+        for (int i = 1; i < 64; i++) { // Start from 1 since :i would be empty for i=0
+            for (int head = 0; head < 32; head++) {
+                // Clone row i up to position i (equivalent to attn[..., i, :i])
+                float row[64];
+                for (int j = 0; j < i; j++) {
+                    row[j] = attn[head][i][j];
+                }
+
+                float sub[64][64];
+                for (int k = 0; k < i; k++) {
+                    for (int j = 0; j < i; j++) {
+                        sub[k][j] = attn[head][k][j];
+                    }
+                }
+
+                for (int j = 0; j < i; j++) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < i; k++) {
+                        sum += row[k] * sub[k][j];
+                    }
+                    attn[head][i][j] = row[j] + sum;
+                }
+            }
+        }
+
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                attn[h][i][i] += 1.0f;
+            }
+        }
+
+        volatile int dummy = 0;
+
+#if 0
             /* apply decay mask */
             for (int i = 0; i < offset; ++i) {
                 attn[i] = -(attn[i] * r->layers[layer].decay_mask[chunk].attn[h][pos][i]);
@@ -1251,8 +1317,10 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
             /* attn = attn + torch.eye */
             attn[offset] = 1.0f;
-        }
+#endif
+    }
 
+#if 0
         /*
          * value = attn @ v_beta
          * 64x128 = 64x64 @ 64x128
@@ -1423,7 +1491,6 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             }
         }
 #endif
-    }
 #if 0
      else {
         /* recurrent gated delta rule */
