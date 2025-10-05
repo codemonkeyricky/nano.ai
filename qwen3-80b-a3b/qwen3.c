@@ -1435,24 +1435,38 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
                 }
             }
 
-            volatile int dummy = 0;
-#if 0
-            /* (g[:, :, i, -1, None] - g[:, :, i]).exp() */
             for (int h = 0; h < 32; ++h) {
                 for (int j = 0; j < 64; ++j) {
-                    g_copy.decay[h][j] = expf(g_copy.decay[h][j]);
+                    g_tmp[h][j] = expf(g_tmp[h][j]);
                 }
             }
 
             /* k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp() */
-            struct ProjectionChunk k_i = r->layers[layer].k_cache[chunk]; /* 32x64x128 */
             for (int h = 0; h < 32; ++h) {
                 for (int i = 0; i < 64; ++i) {
                     for (int j = 0; j < 128; ++j) {
-                        k_i.attn[h][i][j] *= g_copy.decay[h][i];
+                        kk[h][i][j] *= g_tmp[h][i];
                     }
                 }
             }
+
+            /* (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new */
+            static float lrs_tmp[32][128][128] = {};
+            for (int h = 0; h < 32; ++h) {
+                static float tmp[128][64] = {};
+                static float v_new_t[128][64] = {};
+                transpose((float *)tmp, (float *)kk[h], 64, 128);
+                transpose((float *)v_new_t, (float *)v_new[h], 64, 128);
+                /* 128x64 @ 64x128 = 128x128 */
+                for (int i = 0; i < 128; ++i) {
+                    matmul_f32((float *)lrs_tmp[h][i], (float *)tmp[i], (float *)v_new_t, 64, 128); /* 1x128 */
+                }
+            }
+
+            volatile int dummy = 0;
+#if 0
+
+            
 
             struct RecurrentState *last_recurrent_state = r->layers[layer].last_recurrent_state;
             for (int h = 0; h < 32; ++h) {
