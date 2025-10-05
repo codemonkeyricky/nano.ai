@@ -127,14 +127,14 @@ struct RLayer {
     struct ProjectionChunk *k_beta_exp_cache;
     struct ProjectionChunk *v_beta_cache;
     struct ProjectionChunk *k_cumdecay;
-    struct ProjectionChunk *v_prime;
-    struct ProjectionChunk *v_new;
     struct ProjectionChunk *value;
-    struct RecurrentState *last_recurrent_state;
     struct ProjectionChunk *core_attn_out;
     struct DecayChunk *beta;
     struct DecayChunk *g;
     struct AttentionChunk *decay_mask;
+    float v_prime[32][64][128];
+    float v_new[32][64][128];
+    float last_recurrent_state[32][128][128];
 };
 
 struct Runtime {
@@ -915,6 +915,7 @@ void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const
         g_exp[i] = expf(g[i]);
     }
 
+#if 0
     /* last_recurrent_state = last_recurrent_state * g_t */
     for (int h = 0; h < 32; ++h) {
         float *recurrent = (float *)r->layers[layer].last_recurrent_state->decay[h]; /* 128x128 */
@@ -996,6 +997,7 @@ void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const
             }
         }
     }
+#endif
 }
 
 // #pragma GCC pop_options
@@ -1339,51 +1341,26 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             }
         }
 
+        float (*last_recurrent_state)[128][128] = r->layers[layer].last_recurrent_state;
+        float (*v_prime)[64][128] = r->layers[layer].v_prime;
+        for (int h = 0; h < 32; ++h) {
+            float tmp[128][128] = {};
+            transpose((float *)tmp, (float *)last_recurrent_state[h], 128, 128);
+            for (int i = 0; i < 64; ++i) {
+                matmul_f32(v_prime[h][i], k_cumdecay[h][i], (float *)tmp, 64, 128); /* 1x64 @ 64x128 = 1x128*/
+            }
+        }
+
+        float (*v_new)[64][128] = r->layers[layer].v_new;
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                subtract_f32(v_new[h][i], value[h][i], v_prime[h][i], 128);
+            }
+        }
+
         volatile int dummy = 0;
 
 #if 0
-
-        // int chunk = pos / 64;
-        // int offset = pos % 64;
-        int chunks = ((pos + 1) + 63) / 64;
-
-        // struct RecurrentState emptyRecurrentState = {};
-        // *r->layers[layer].last_recurrent_state = emptyRecurrentState;
-
-        struct ProjectionChunk project_chunk_zeroes = {};
-        r->layers[layer].core_attn_out[chunk] = project_chunk_zeroes;
-
-        /* attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0) */
-        float attention[32][64] = {}; /* attention for current token only */
-        for (int h = 0; h < 32; ++h) {
-            float *q = r->layers[layer].query->attn[h];                  /* 1x1x128 */
-            float *k = (float *)r->layers[layer].k_cache[chunk].attn[h]; /* 1x64x128 */
-            float *attn = attention[h];                                  /* 1x64 */
-            matmul_f32(attn, q, k, 128, 64);
-            mul_f32(attn, attn, r->layers[layer].decay_mask[chunk].attn[h][offset], 64);
-        }
-
-        /* TODO: v_prime and v_new requires previous tokens because
-         * attention calculation requires them later */
-
-        /* v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state */
-        for (int h = 0; h < 32; ++h) {
-            float *k_cumdecay = (float *)r->layers[layer].k_cumdecay[chunk].attn[h][offset]; /* 1x128 */
-            float *recurrent = (float *)r->layers[layer].last_recurrent_state->decay[h];     /* 128x128 */
-            float *v_prime = (float *)r->layers[layer].v_prime[chunk].attn[h][offset];       /* 1x128 */
-            float tmp[128][128] = {};
-            transpose((float *)tmp, recurrent, 128, 128);
-            matmul_f32(v_prime, k_cumdecay, (float *)tmp, 128, 128);
-        }
-
-        /* v_new = v_i - v_prime */
-        for (int h = 0; h < 32; ++h) {
-            float *v_i = (float *)r->layers[layer].value[chunk].attn[h][offset];
-            float *v_prime = (float *)r->layers[layer].v_prime[chunk].attn[h][offset]; /* 1x128 */
-            float *v_new = (float *)r->layers[layer].v_new[chunk].attn[h][offset];     /* 1x128 */
-            subtract_f32(v_new, v_i, v_prime, 128);
-        }
-
         /*
          * attn_inter = (q_i * g[:, :, i, :, None].exp()) @last_recurrent_state
          *
@@ -1558,10 +1535,10 @@ void runtime_init(struct Transformer *xfmr) {
         r->layers[i].query = (struct Projection *)aligned_malloc(1, sizeof(struct Projection));
 
         r->layers[i].k_cumdecay = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
-        r->layers[i].v_prime = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
-        r->layers[i].v_new = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        // r->layers[i].v_prime = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        // r->layers[i].v_new = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
 
-        r->layers[i].last_recurrent_state = (struct RecurrentState *)calloc(1, sizeof(struct RecurrentState));
+        // r->layers[i].last_recurrent_state = (struct RecurrentState *)calloc(1, sizeof(struct RecurrentState));
 
         r->layers[i].core_attn_out = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
 
