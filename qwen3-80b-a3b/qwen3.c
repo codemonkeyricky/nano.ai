@@ -128,13 +128,17 @@ struct RLayer {
     struct ProjectionChunk *v_beta_cache;
     struct ProjectionChunk *k_cumdecay;
     struct ProjectionChunk *value;
-    struct ProjectionChunk *core_attn_out;
     struct DecayChunk *beta;
     struct DecayChunk *g;
     struct AttentionChunk *decay_mask;
     float v_prime[32][64][128];
     float v_new[32][64][128];
+    float v_new_transposed[32][128][64];
     float last_recurrent_state[32][128][128];
+    float last_recurrent_state_transposed[32][128][128];
+    float attn_inter[32][64][128];
+    float g_exp[32][64];
+    float core_attn_out[32][64][128];
 };
 
 struct Runtime {
@@ -1341,13 +1345,17 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             }
         }
 
-        float (*last_recurrent_state)[128][128] = r->layers[layer].last_recurrent_state;
+        float (*state)[128][128] = r->layers[layer].last_recurrent_state;
+        float (*state_t)[128][128] = r->layers[layer].last_recurrent_state_transposed;
+
+        for (int h = 0; h < 32; ++h) {
+            transpose((float *)state_t[h], (float *)state[h], 128, 128);
+        }
+
         float (*v_prime)[64][128] = r->layers[layer].v_prime;
         for (int h = 0; h < 32; ++h) {
-            float tmp[128][128] = {};
-            transpose((float *)tmp, (float *)last_recurrent_state[h], 128, 128);
             for (int i = 0; i < 64; ++i) {
-                matmul_f32(v_prime[h][i], k_cumdecay[h][i], (float *)tmp, 64, 128); /* 1x64 @ 64x128 = 1x128*/
+                matmul_f32(v_prime[h][i], k_cumdecay[h][i], (float *)state_t[h], 64, 128); /* 1x64 @ 64x128 = 1x128*/
             }
         }
 
@@ -1356,6 +1364,63 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             for (int i = 0; i < 64; ++i) {
                 subtract_f32(v_new[h][i], value[h][i], v_prime[h][i], 128);
             }
+        }
+
+        float (*g_exp)[64] = r->layers[layer].g_exp;
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                g_exp[h][i] = expf(g[h][i]);
+            }
+        }
+
+        float (*attn_inter)[64][128] = r->layers[layer].attn_inter;
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 128; ++j) {
+                    attn_inter[h][i][j] = qq[h][i][j] * g_exp[h][i];
+                }
+            }
+        }
+
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                matmul_f32(attn_inter[h][i], attn_inter[h][i], (float *)state_t[h], 128, 128);
+            }
+        }
+
+        /* attn @ v_new */
+        float (*core_attn_out)[64][128] = r->layers[layer].core_attn_out;
+        {
+            float (*v_new_t)[128][64] = r->layers[layer].v_new_transposed;
+            for (int h = 0; h < 32; ++h) {
+                transpose((float *)v_new_t[h], (float *)v_new[h], 64, 128);
+            }
+
+            static float tmp[32][64][128] = {};
+            for (int h = 0; h < 32; ++h) {
+                for (int i = 0; i < 64; ++i) {
+                    matmul_f32(tmp[h][i], attn2[h][i], (float *)v_new_t[h], 64, 128); /* 1x64 @ 64x128 = 1x128*/
+                }
+            }
+
+            for (int h = 0; h < 32; ++h) {
+                for (int i = 0; i < 64; ++i) {
+                    for (int j = 0; j < 128; ++j) {
+                        core_attn_out[h][i][j] = attn_inter[h][i][j] + tmp[h][i][j];
+                    }
+                }
+            }
+        }
+
+
+        /*
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+            */
+        {
+
         }
 
         volatile int dummy = 0;
@@ -1540,7 +1605,7 @@ void runtime_init(struct Transformer *xfmr) {
 
         // r->layers[i].last_recurrent_state = (struct RecurrentState *)calloc(1, sizeof(struct RecurrentState));
 
-        r->layers[i].core_attn_out = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        // r->layers[i].core_attn_out = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
 
         r->layers[i].g = (struct DecayChunk *)calloc(chunks, sizeof(struct DecayChunk));
         r->layers[i].beta = (struct DecayChunk *)calloc(chunks, sizeof(struct DecayChunk));
