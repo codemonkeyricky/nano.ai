@@ -1749,7 +1749,9 @@ int main() {
 
             if (m->layers[k].q_proj_w) {
 #if 0
-                self_attention(embeddings, embeddings2, x, k, pos, sin, cos);
+                for (int i = 0; i < n; ++i) {
+                    self_attention((*emb)[i], (*emb2)[i], x, k, pos, sin, cos);
+                }
 #endif
             } else {
                 /* core_attn_out is 32x128, and we allocated 16x256 ... */
