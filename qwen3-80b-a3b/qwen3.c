@@ -1501,7 +1501,9 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     }
 
-    __bf16 post_lan[64][2048]; /* post linear attention norm */
+    /* linear attention normalize core_attn_out */
+
+    __bf16 post_lan[64][4096]; /* post linear attention norm */
     for (int i = 0; i < n; ++i) {
         /* Pull out head and dim per token */
         __bf16 tmp[32][128] = {};
@@ -1511,14 +1513,15 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             }
         }
 
-        /* xout = 2048, tmp = 32x128, z[i] = 32x128, */
+        /* post_lan[i] = 4096, tmp = 32x128, z[i] = 32x128, */
         rmsnorm_gated(post_lan[i], (__bf16 *)tmp, (__bf16 *)z[i], m->layers[layer].linear_attn_norm, 32, 128);
     }
-    // memcpy(tmp, xout, 32 * 128 * sizeof(__bf16));
 
-#if 0
-    matmul(xout, tmp, m->layers[layer].linear_attn_out_proj_w, 4096, c->hidden_size);
-#endif
+    /* out projection */
+
+    for (int i = 0; i < n; ++i) {
+        matmul(xout[i], post_lan[i], m->layers[layer].linear_attn_out_proj_w, 4096, 2048);
+    }
 }
 
 void *aligned_malloc(size_t alignment, size_t size) {
