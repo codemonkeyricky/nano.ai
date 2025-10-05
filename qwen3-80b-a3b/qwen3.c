@@ -1346,17 +1346,17 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             }
         }
 
-        float (*state)[128][128] = r->layers[layer].last_recurrent_state;
-        float (*state_t)[128][128] = r->layers[layer].last_recurrent_state_transposed;
+        float (*lrs)[128][128] = r->layers[layer].last_recurrent_state;
+        float (*lrs_t)[128][128] = r->layers[layer].last_recurrent_state_transposed;
 
         for (int h = 0; h < 32; ++h) {
-            transpose((float *)state_t[h], (float *)state[h], 128, 128);
+            transpose((float *)lrs_t[h], (float *)lrs[h], 128, 128);
         }
 
         float (*v_prime)[64][128] = r->layers[layer].v_prime;
         for (int h = 0; h < 32; ++h) {
             for (int i = 0; i < 64; ++i) {
-                matmul_f32(v_prime[h][i], k_cumdecay[h][i], (float *)state_t[h], 64, 128); /* 1x64 @ 64x128 = 1x128*/
+                matmul_f32(v_prime[h][i], k_cumdecay[h][i], (float *)lrs_t[h], 64, 128); /* 1x64 @ 64x128 = 1x128*/
             }
         }
 
@@ -1385,7 +1385,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
         for (int h = 0; h < 32; ++h) {
             for (int i = 0; i < 64; ++i) {
-                matmul_f32(attn_inter[h][i], attn_inter[h][i], (float *)state_t[h], 128, 128);
+                matmul_f32(attn_inter[h][i], attn_inter[h][i], (float *)lrs_t[h], 128, 128);
             }
         }
 
@@ -1420,11 +1420,6 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         )
             */
         {
-            /*
-             * last_recurrent_state = (
-             *   last_recurrent_state * g[:, :, i, -1, None, None].exp()
-             *   + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-             */
 
             float (*g_tmp)[64] = r->layers[layer].g_tmp;
 
@@ -1450,7 +1445,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
                 }
             }
 
-            /* (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new */
+            /* lrs_tmp = (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new */
             static float lrs_tmp[32][128][128] = {};
             for (int h = 0; h < 32; ++h) {
                 static float tmp[128][64] = {};
@@ -1463,38 +1458,31 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
                 }
             }
 
-            volatile int dummy = 0;
-#if 0
-
-            
-
-            struct RecurrentState *last_recurrent_state = r->layers[layer].last_recurrent_state;
+            /* last_recurrent_state * g[:, :, i, -1, None, None].exp() */
             for (int h = 0; h < 32; ++h) {
-                float tmp[128][64] = {};
-                transpose((float *)tmp, (float *)k_i.attn[h], 64, 128); /* 128x64 */
                 for (int i = 0; i < 128; ++i) {
-                    tmp[i];                                                        /* 1x64 */
-                    float *v_new = (float *)r->layers[layer].v_new[chunk].attn[h]; /* 64x128 */
-                    float tmp2[128][64] = {};
-                    transpose((float *)tmp2, v_new, 64, 128);
-                    matmul_f32((float *)last_recurrent_state->decay[h][i], (float *)tmp[i], (float *)tmp2, 64,
-                               128); /* 1x128 */
+                    for (int j = 0; j < 128; ++j) {
+                        lrs[h][i][j] *= expf(g[h][63]);
+                    }
                 }
             }
-#endif
+
+            for (int h = 0; h < 32; ++h) {
+                for (int i = 0; i < 128; ++i) {
+                    for (int j = 0; j < 128; ++j) {
+                        lrs[h][i][j] += lrs_tmp[h][i][j];
+                    }
+                }
+            }
         }
-
-#if 0
-
-#endif
-#if 0
-     else {
+    } else {
         /* recurrent gated delta rule */
-        recurrent_gated_delta_rule(g, beta, layer, pos, xfmr);
+        // recurrent_gated_delta_rule(g, beta, layer, pos, xfmr);
     }
 
     /* last_recurrent_state * g[:, :, i, -1, None, None].exp() + ...  */
 
+    #if 0
     /* convert back to bf16 */
     __bf16 tmp[32 * 128] = {};
     for (int h = 0; h < 32; ++h) {
@@ -1513,8 +1501,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
     memcpy(tmp, xout, 32 * 128 * sizeof(__bf16));
 
     matmul(xout, tmp, m->layers[layer].linear_attn_out_proj_w, 4096, c->hidden_size);
-#endif
-    }
+    #endif
 }
 
 void *aligned_malloc(size_t alignment, size_t size) {
