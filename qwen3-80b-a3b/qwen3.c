@@ -1292,100 +1292,56 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         static float value[32][64][128] = {};
         for (int h = 0; h < 32; ++h) {
             for (int i = 0; i < 64; ++i) {
-
-                static float tmp[128][64] = {};
+                float tmp[128][64] = {};
                 transpose((float *)tmp, (float *)vv_beta[h], 64, 128);
-
                 matmul_f32(value[h][i], attn[h][i], (float *)tmp, 64, 128);
+            }
+        }
+
+        /* k_beta * g.exp() */
+        /* float g[32][64] = {}; */
+        /* static float kk_beta[32][64][128] = {}; */
+        static float kk_beta_exp[32][64][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 128; ++j) {
+                    kk_beta_exp[h][i][j] = kk_beta[h][i][j] * expf(g[h][i]);
+                }
+            }
+        }
+
+        static float k_cumdecay[32][64][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                float tmp[128][64] = {};
+                transpose((float *)tmp, (float *)kk_beta_exp[h], 64, 128);
+                matmul_f32(k_cumdecay[h][i], attn[h][i], (float *)tmp, 64, 128);
+            }
+        }
+
+        /*
+         * TODO:
+         * last_current_state is 32x128x128
+         * core_attn_out is 32x64x128
+         * initialized to all zeroes at start.
+         */
+
+        static float attn2[32][64][64] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                matmul_f32(attn2[h][i], qq[h][i], (float *)kk[h], 128, 64);
+            }
+
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 64; ++j) {
+                    attn2[h][i][j] *= decay_mask[h][i][j];
+                }
             }
         }
 
         volatile int dummy = 0;
 
 #if 0
-            /* apply decay mask */
-            for (int i = 0; i < offset; ++i) {
-                attn[i] = -(attn[i] * r->layers[layer].decay_mask[chunk].attn[h][pos][i]);
-            }
-
-            float (*attn2)[64] = r->layers[layer].attn_cache[chunk].attn[h];
-            float tmp[offset][offset];
-            memset(tmp, 0, sizeof(tmp));
-            for (int i = 0; i < offset; ++i) {
-                /* upper right is cleared */
-                for (int j = 0; j < i; ++j) {
-                    tmp[i][j] = attn2[i][j];
-                }
-            }
-
-            /* row.unsqueeze(-1) * sub */
-            for (int i = 0; i < offset; ++i) {
-                for (int j = 0; j < offset - 1; ++j) {
-                    tmp[i][j] *= attn2[offset][i];
-                }
-            }
-
-            /* vertical summation */
-            for (int j = 0; j < offset; j++) {
-                float sum = 0.0f;
-                for (int i = 0; i < offset; i++) {
-                    sum += tmp[i][j];
-                }
-                attn2[offset][j] += sum;
-            }
-
-            /* attn = attn + torch.eye */
-            attn[offset] = 1.0f;
-#endif
-    }
-
-#if 0
-        /*
-         * value = attn @ v_beta
-         * 64x128 = 64x64 @ 64x128
-         */
-        for (int h = 0; h < 32; ++h) {
-            float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h][offset];
-            float *v_beta = (float *)r->layers[layer].v_beta_cache[chunk].attn[h];
-            float *value = (float *)r->layers[layer].value[chunk].attn[h][offset];
-
-            /*
-             * attn attending to all v_beta
-             * 1x64 @ 64x128 = 1x128
-             */
-
-            float tmp[128][64] = {};
-            transpose((float *)tmp, v_beta, 64, 128);
-            matmul_f32(value, attn, (float *)tmp, 64, 128);
-        }
-
-        /* k_beta * g.exp() */
-        for (int h = 0; h < 32; ++h) {
-            float g = r->layers[layer].g[chunk].decay[h][pos];
-            float g_exp = expf(g);
-            float *k_beta = (float *)r->layers[layer].k_beta_cache[chunk].attn[h][offset];
-            float *k_beta_exp = (float *)r->layers[layer].k_beta_exp_cache[chunk].attn[h][offset];
-            for (int j = 0; j < 128; ++j) {
-                k_beta_exp[j] = k_beta[j] * g_exp;
-            }
-        }
-
-        /* k_cumdecay = attn @ (k_beta * g.exp()) */
-        for (int h = 0; h < 32; ++h) {
-            float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h][offset];
-            float *k_beta = (float *)r->layers[layer].k_beta_exp_cache[chunk].attn[h];
-            float *k_cumdecay = (float *)r->layers[layer].k_cumdecay[chunk].attn[h][offset];
-
-            /*
-             * attn is 1x64
-             * (k_beta * g.exp()) is 64x128
-             * k_cumdecay is 1x128
-             */
-
-            float tmp[128][64] = {};
-            transpose((float *)tmp, k_beta, 64, 128);
-            matmul_f32(k_cumdecay, attn, (float *)tmp, 64, 128);
-        }
 
         // int chunk = pos / 64;
         // int offset = pos % 64;
@@ -1537,6 +1493,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
     matmul(xout, tmp, m->layers[layer].linear_attn_out_proj_w, 4096, c->hidden_size);
 #endif
+    }
 }
 
 void *aligned_malloc(size_t alignment, size_t size) {
@@ -1815,7 +1772,7 @@ int main() {
                 volatile int dummy = 0;
             }
 
-            float top_scores[c->num_experts_per_token] = {};
+            float top_scores[c->num_ex(k_beta * g.exp().unsqueeze(-1))perts_per_token] = {};
             for (size_t i = 0; i < c->num_experts_per_token; ++i) {
                 top_scores[i] = ranks[i].score;
             }
@@ -1852,7 +1809,7 @@ int main() {
              */
 
             /* shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output */
-
+(k_beta * g.exp().unsqueeze(-1))
             /* gate projection */
             __bf16 gate = 0;
             matmul(&gate, embeddings, m->layers[k].shared_expert->gate, 2048, 1);
