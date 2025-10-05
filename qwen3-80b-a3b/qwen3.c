@@ -1688,17 +1688,17 @@ int main() {
 
     int attn_hiddn_size = c->n_heads * c->head_dim;
 
-    __bf16 (*skip)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
-    __bf16 (*emb)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
-    __bf16 (*emb2)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
-    __bf16 (*emb3)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
-    __bf16 (*emb4)[64][2048] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size);
+    __bf16 residual[64][2048] __attribute__((aligned(64)));
+    __bf16 emb[64][2048] __attribute__((aligned(64)));
+    __bf16 emb2[64][2048] __attribute__((aligned(64)));
+    __bf16 emb3[64][2048] __attribute__((aligned(64)));
+    __bf16 emb4[64][2048] __attribute__((aligned(64)));
 
-    __bf16 (*mlp_embeddings)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->intermediate_size);
-    __bf16 (*mlp_embeddings2)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->intermediate_size);
-    __bf16 (*mlp_embeddings3)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->intermediate_size);
-    __bf16 (*mlp_embeddings4)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->intermediate_size);
-    __bf16 (*expert_output)[64][4096] = aligned_malloc(64, 64 * sizeof(__bf16) * c->hidden_size * c->num_experts);
+    __bf16 mlp[4096] __attribute__((aligned(64)));
+    __bf16 mlp2[4096] __attribute__((aligned(64)));
+    __bf16 mlp3[4096] __attribute__((aligned(64)));
+    __bf16 mlp4[4096] __attribute__((aligned(64)));
+    __bf16 expert_output[4096] __attribute__((aligned(64)));
 
     int stop_tokens[3] = {151645, 151644, 151643};
 
@@ -1729,7 +1729,7 @@ int main() {
 
         int n = prefill ? prompt_len : 1;
         for (int i = 0; i < n; ++i) {
-            memcpy((*emb)[i], m->embeddings + tokens[pos + i] * c->hidden_size, c->hidden_size * sizeof(__bf16));
+            memcpy(emb[i], m->embeddings + tokens[pos + i] * c->hidden_size, c->hidden_size * sizeof(__bf16));
         }
 
         for (int i = 0; i < n; ++i) {
@@ -1738,13 +1738,13 @@ int main() {
 
         for (int k = 0; k < x->config.n_layers; k++) {
 
-            /* save skip */
+            /* save residual */
             for (int i = 0; i < n; ++i) {
-                memcpy(skip, (*emb)[i], c->hidden_size * sizeof(__bf16));
+                memcpy(residual[i], emb[i], c->hidden_size * sizeof(__bf16));
             }
 
             for (int i = 0; i < n; ++i) {
-                layernorm((*emb2)[i], (*emb)[i], m->layers[k].input_layernorm, x);
+                layernorm(emb2[i], emb[i], m->layers[k].input_layernorm, x);
             }
 
             if (m->layers[k].q_proj_w) {
@@ -1755,105 +1755,103 @@ int main() {
 #endif
             } else {
                 /* core_attn_out is 32x128, and we allocated 16x256 ... */
-                linear_attention(*emb, *emb2, x, k, n, sin, cos, prefill);
-            }
-#if 0
-            /* residual */
-            add(embeddings2, embeddings,skip, c->hidden_size);
-
-            /* save skip */
-            memcpy(skip, embeddings2, c->hidden_size * sizeof(__bf16));
-
-            layernorm(embeddings, embeddings2, m->layers[k].post_attn_layernorm, x);
-
-            /* gate projection to find experts */
-            matmul(mlp_embeddings, embeddings, m->layers[k].gate, c->hidden_size, c->num_experts);
-
-            struct ExpertRank ranks[c->num_experts];
-            for (size_t i = 0; i < c->num_experts; ++i) {
-                ranks[i].index = i;
-                ranks[i].score = (float)mlp_embeddings[i];
+                linear_attention(emb, emb2, x, k, n, sin, cos, prefill);
             }
 
-            qsort(ranks, c->num_experts, sizeof(struct ExpertRank), compare_expert_rank_desc);
+            /* residual connection */
+            for (int i = 0; i < n; ++i) {
+                add(emb2[i], emb[i], residual[i], c->hidden_size);
+            }
 
-            __bf16 experts[c->num_experts_per_token][c->hidden_size] __attribute__((aligned(64))) = {};
+            /* save residual */
+            for (int i = 0; i < n; ++i) {
+                memcpy(residual[i], emb2[i], 2048 * sizeof(__bf16));
+            }
 
-            for (size_t kk = 0; kk < c->num_experts_per_token; ++kk) {
+            /* post layer norm */
+            for (int i = 0; i < n; ++i) {
+                layernorm(emb[i], emb2[i], m->layers[k].post_attn_layernorm, x);
+            }
 
-                int ex = ranks[kk].index;
+            for (int i = 0; i < n; ++i) {
+                /* gate projection to find experts */
+                matmul(mlp, emb[i], m->layers[k].gate, 2048, 512);
 
-                /* gate projection */
-                matmul(mlp_embeddings, embeddings, m->layers[k].experts[ex].gate_proj, c->hidden_size,
-                       c->moe_intermediate_size);
-                silu_array(mlp_embeddings2, mlp_embeddings, c->moe_intermediate_size);
+                struct ExpertRank ranks[c->num_experts];
+                for (size_t i = 0; i < c->num_experts; ++i) {
+                    ranks[i].index = i;
+                    ranks[i].score = (float)mlp[i];
+                }
+
+                qsort(ranks, c->num_experts, sizeof(struct ExpertRank), compare_expert_rank_desc);
+
+                __bf16 experts[c->num_experts_per_token][c->hidden_size] __attribute__((aligned(64))) = {};
+
+                for (size_t kk = 0; kk < c->num_experts_per_token; ++kk) {
+
+                    int ex = ranks[kk].index;
+
+                    /* gate projection */
+                    matmul(mlp, emb[i], m->layers[k].experts[ex].gate_proj, c->hidden_size, c->moe_intermediate_size);
+                    silu_array(mlp2, mlp, c->moe_intermediate_size);
+
+                    /* up projection */
+                    matmul(mlp3, emb[i], m->layers[k].experts[ex].up_proj, c->hidden_size, c->moe_intermediate_size);
+
+                    /* hidden */
+                    mul(mlp, mlp2, mlp3, c->moe_intermediate_size);
+
+                    /* down */
+                    matmul(experts[kk], mlp, m->layers[k].experts[ex].down_proj, c->moe_intermediate_size,
+                           c->hidden_size);
+                }
+
+                float top_scores[c->num_experts_per_token] = {};
+                for (size_t i = 0; i < c->num_experts_per_token; ++i) {
+                    top_scores[i] = ranks[i].score;
+                }
+                softmax(top_scores, c->num_experts_per_token);
+
+                __bf16 combined[c->hidden_size] = {};
+                for (size_t k = 0; k < c->num_experts_per_token; ++k) {
+                    for (size_t kk = 0; kk < c->hidden_size; ++kk) {
+                        combined[kk] += (__bf16)(top_scores[k] * (float)experts[k][kk]);
+                    }
+                }
+
+                /* shared_expert_output = self.shared_expert(hidden_states) */
+
+                /* gate projection + silu */
+                matmul(mlp, emb[i], m->layers[k].shared_expert->gate_proj, c->hidden_size, c->moe_intermediate_size);
+                silu_array(mlp2, mlp, c->moe_intermediate_size);
 
                 /* up projection */
-                matmul(mlp_embeddings3, embeddings, m->layers[k].experts[ex].up_proj, c->hidden_size,
-                       c->moe_intermediate_size);
+                matmul(mlp, emb[i], m->layers[k].shared_expert->up_proj, c->hidden_size, c->moe_intermediate_size);
 
-                /* hidden */
-                mul(mlp_embeddings, mlp_embeddings2, mlp_embeddings3, c->moe_intermediate_size);
+                /* product */
+                mul(mlp3, mlp2, mlp, c->moe_intermediate_size);
 
-                /* down */
-                matmul(experts[kk], mlp_embeddings, m->layers[k].experts[ex].down_proj, c->moe_intermediate_size,
-                       c->hidden_size);
+                /* down projection  */
+                matmul(emb2[i], mlp3, m->layers[k].shared_expert->down_proj, c->moe_intermediate_size, c->hidden_size);
 
-                volatile int dummy = 0;
+                /*
+                 * embeddings -> hidden
+                 * embeddings2 -> shared_expert_output
+                 */
+
+                /* shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output */
+                /* gate projection */
+                __bf16 gate = 0;
+                matmul(&gate, emb[i], m->layers[k].shared_expert->gate, 2048, 1);
+                gate = sigmoid(gate);
+
+                mul_scalar(emb[i], emb2[i], gate, c->hidden_size);
+
+                /* final_hidden_states = final_hidden_states + shared_expert_output */
+                add(emb2[i], combined, emb[i], c->hidden_size);
+
+                add(emb[i], emb2[i], residual[i], c->hidden_size);
             }
-
-            float top_scores[c->num_ex(k_beta * g.exp().unsqueeze(-1))perts_per_token] = {};
-            for (size_t i = 0; i < c->num_experts_per_token; ++i) {
-                top_scores[i] = ranks[i].score;
-            }
-            softmax(top_scores, c->num_experts_per_token);
-
-            __bf16 combined[c->hidden_size] = {};
-            for (size_t k = 0; k < c->num_experts_per_token; ++k) {
-                for (size_t kk = 0; kk < c->hidden_size; ++kk) {
-                    combined[kk] += (__bf16)(top_scores[k] * (float)experts[k][kk]);
-                }
-            }
-
-            /* shared_expert_output = self.shared_expert(hidden_states) */
-
-            /* gate projection + silu */
-            matmul(mlp_embeddings, embeddings, m->layers[k].shared_expert->gate_proj, c->hidden_size,
-                   c->moe_intermediate_size);
-            silu_array(mlp_embeddings2, mlp_embeddings, c->moe_intermediate_size);
-
-            /* up projectoin */
-            matmul(mlp_embeddings, embeddings, m->layers[k].shared_expert->up_proj, c->hidden_size,
-                   c->moe_intermediate_size);
-
-            /* product */
-            mul(mlp_embeddings3, mlp_embeddings2, mlp_embeddings, c->moe_intermediate_size);
-
-            /* down projection  */
-            matmul(embeddings2, mlp_embeddings3, m->layers[k].shared_expert->down_proj, c->moe_intermediate_size,
-                   c->hidden_size);
-
-            /*
-             * embeddings -> hidden
-             * embeddings2 -> shared_expert_output
-             */
-
-            /* shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output */
-(k_beta * g.exp().unsqueeze(-1))
-            /* gate projection */
-            __bf16 gate = 0;
-            matmul(&gate, embeddings, m->layers[k].shared_expert->gate, 2048, 1);
-            gate = sigmoid(gate);
-
-            mul_scalar(embeddings, embeddings2, gate, c->hidden_size);
-
-            /* final_hidden_states = final_hidden_states + shared_expert_output */
-            add(embeddings2, combined, embeddings, c->hidden_size);
-
-            add(embeddings, embeddings2, skip, c->hidden_size);
-
-            volatile int dummy = 0;
-#endif
         }
 
 #if 0
