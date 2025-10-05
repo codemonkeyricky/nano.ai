@@ -141,6 +141,7 @@ struct RLayer {
     float g_tmp[32][64];
     float core_attn_out[32][64][128];
     __bf16 core_attn_out_bf16[32][64][128];
+    __bf16 z[64][32][128];
 };
 
 struct Runtime {
@@ -1492,12 +1493,17 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     }
 
-#if 0
-    __bf16 zz[32 * 128] = {};
-    for (int h = 0; h < 16; ++h) {
-        memcpy(&zz[h * 256], qkvz->head[h].z, 256 * sizeof(__bf16));
+    __bf16 (*z)[32][128] = r->layers[layer].z;
+    for (int i = 0; i < 64; ++i) {
+        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)(*qkvz)[i];
+        for (int h = 0; h < 16; ++h) {
+            memcpy(z[i][h * 2], p_qkvz->head[h].z, 256 * sizeof(__bf16));
+        }
+
+        volatile int dummy = 0;
     }
 
+#if 0
     rmsnorm_gated(xout, tmp, zz, m->layers[layer].linear_attn_norm, 32, 128);
     memcpy(tmp, xout, 32 * 128 * sizeof(__bf16));
 
