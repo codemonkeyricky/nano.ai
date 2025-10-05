@@ -1227,6 +1227,15 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             }
         }
 
+        static float vv_beta[32][64][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 128; ++j) {
+                    vv_beta[h][i][j] = vv[h][i][j] * beta[i][h];
+                }
+            }
+        }
+
         float attn[32][64][64] = {};
 
         for (int h = 0; h < 32; ++h) {
@@ -1250,9 +1259,8 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             }
         }
 
-        for (int i = 1; i < 64; i++) { // Start from 1 since :i would be empty for i=0
+        for (int i = 1; i < 64; i++) {
             for (int head = 0; head < 32; head++) {
-                // Clone row i up to position i (equivalent to attn[..., i, :i])
                 float row[64];
                 for (int j = 0; j < i; j++) {
                     row[j] = attn[head][i][j];
@@ -1278,6 +1286,17 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         for (int h = 0; h < 32; ++h) {
             for (int i = 0; i < 64; ++i) {
                 attn[h][i][i] += 1.0f;
+            }
+        }
+
+        static float value[32][64][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+
+                static float tmp[128][64] = {};
+                transpose((float *)tmp, (float *)vv_beta[h], 64, 128);
+
+                matmul_f32(value[h][i], attn[h][i], (float *)tmp, 64, 128);
             }
         }
 
