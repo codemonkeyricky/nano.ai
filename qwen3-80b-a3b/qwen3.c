@@ -140,6 +140,7 @@ struct RLayer {
     float g_exp[32][64];
     float g_tmp[32][64];
     float core_attn_out[32][64][128];
+    __bf16 core_attn_out_bf16[32][64][128];
 };
 
 struct Runtime {
@@ -1480,18 +1481,18 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         // recurrent_gated_delta_rule(g, beta, layer, pos, xfmr);
     }
 
-    /* last_recurrent_state * g[:, :, i, -1, None, None].exp() + ...  */
-
-    #if 0
     /* convert back to bf16 */
-    __bf16 tmp[32 * 128] = {};
+    float (*cao)[64][128] = r->layers[layer].core_attn_out;
+    __bf16 (*cao_bf16)[64][128] = r->layers[layer].core_attn_out_bf16;
     for (int h = 0; h < 32; ++h) {
-        float *core = (float *)r->layers[layer].core_attn_out[chunk].attn[h][offset];
-        for (int j = 0; j < 128; ++j) {
-            tmp[h * 128 + j] = (__bf16)core[j];
+        for (int i = 0; i < 64; ++i) {
+            for (int j = 0; j < 128; ++j) {
+                cao_bf16[h][i][j] = (__bf16)cao[h][i][j];
+            }
         }
     }
 
+#if 0
     __bf16 zz[32 * 128] = {};
     for (int h = 0; h < 16; ++h) {
         memcpy(&zz[h * 256], qkvz->head[h].z, 256 * sizeof(__bf16));
@@ -1501,7 +1502,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
     memcpy(tmp, xout, 32 * 128 * sizeof(__bf16));
 
     matmul(xout, tmp, m->layers[layer].linear_attn_out_proj_w, 4096, c->hidden_size);
-    #endif
+#endif
 }
 
 void *aligned_malloc(size_t alignment, size_t size) {
