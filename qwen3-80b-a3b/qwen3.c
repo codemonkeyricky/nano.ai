@@ -1773,6 +1773,8 @@ int main() {
                 layernorm(emb[i], emb2[i], m->layers[k].post_attn_layernorm, x);
             }
 
+            /* TOO: verified to here */
+
             for (int i = 0; i < n; ++i) {
                 /* gate projection to find experts */
                 matmul(mlp, emb[i], m->layers[k].gate, 2048, 512);
