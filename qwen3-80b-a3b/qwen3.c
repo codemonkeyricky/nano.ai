@@ -1499,14 +1499,24 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         for (int h = 0; h < 16; ++h) {
             memcpy(z[i][h * 2], p_qkvz->head[h].z, 256 * sizeof(__bf16));
         }
-
-        volatile int dummy = 0;
     }
 
-#if 0
-    rmsnorm_gated(xout, tmp, zz, m->layers[layer].linear_attn_norm, 32, 128);
-    memcpy(tmp, xout, 32 * 128 * sizeof(__bf16));
+    __bf16 post_lan[64][2048]; /* post linear attention norm */
+    for (int i = 0; i < n; ++i) {
+        /* Pull out head and dim per token */
+        __bf16 tmp[32][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int j = 0; j < 128; ++j) {
+                tmp[h][j] = cao_bf16[h][i][j];
+            }
+        }
 
+        /* xout = 2048, tmp = 32x128, z[i] = 32x128, */
+        rmsnorm_gated(post_lan[i], (__bf16 *)tmp, (__bf16 *)z[i], m->layers[layer].linear_attn_norm, 32, 128);
+    }
+    // memcpy(tmp, xout, 32 * 128 * sizeof(__bf16));
+
+#if 0
     matmul(xout, tmp, m->layers[layer].linear_attn_out_proj_w, 4096, c->hidden_size);
 #endif
 }
