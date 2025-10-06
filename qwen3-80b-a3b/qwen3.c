@@ -684,9 +684,10 @@ void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const st
 }
 
 __bf16 qg_proj[64][8192];
-
 __bf16 query_state[16][64][256];
 __bf16 gate[64][4096];
+__bf16 key_state[2][64][256];
+__bf16 value_state[2][64][256];
 
 void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
                     const int n, __bf16 sin[64][64], __bf16 cos[64][64]) {
@@ -730,6 +731,37 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
     for (int h = 0; h < 16; ++h) {
         for (int i = 0; i < n; ++i) {
             layernorm_n(query_state[h][i], query_state[i][h], m->layers[layer].q_norm, 256, xfmr);
+        }
+    }
+
+    /* key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2) */
+    {
+        /* projection */
+        for (int i = 0; i < n; ++i) {
+            __bf16 tmp[2][256] = {};
+            matmul((__bf16 *)tmp, x[i], kw, 2048, 512);
+            for (int h = 0; h < 2; ++h) {
+                memcpy(key_state[h][i], tmp[h], 256 * sizeof(__bf16));
+            }
+        }
+
+        /* normalization */
+        for (int i = 0; i < n; ++i) {
+            for (int h = 0; h < 2; ++h) {
+                layernorm_n(key_state[h][i], key_state[h][i], m->layers[layer].k_norm, 256, xfmr);
+            }
+        }
+    }
+
+    /* value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) */
+    {
+        /* projection */
+        for (int i = 0; i < n; ++i) {
+            __bf16 tmp[2][256] = {};
+            matmul((__bf16 *)tmp, x[i], vw, 2048, 512);
+            for (int h = 0; h < 2; ++h) {
+                memcpy(value_state[h][i], tmp[h], 256 * sizeof(__bf16));
+            }
         }
     }
 
