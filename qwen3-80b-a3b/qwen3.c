@@ -683,8 +683,13 @@ void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const st
     }
 }
 
-void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
-                    const int pos, __bf16 *sin, __bf16 *cos) {
+__bf16 qg_proj[64][8192];
+
+__bf16 query_state[64][16][256];
+__bf16 gate[64][4096];
+
+void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
+                    const int n, __bf16 sin[64][64], __bf16 cos[64][64]) {
     struct query_gate {
         __bf16 q[256];
         __bf16 gate[256];
@@ -710,8 +715,20 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
     // int sz = p->kv_heads * p->head_dim;
 
     /* query gate projection */
-    matmul(r->qg, x, qw, 2048, 8192);
+    for (int i = 0; i < n; ++i) {
+        matmul(qg_proj[i], x[i], qw, 2048, 8192);
+    }
 
+    for (int i = 0; i < n; ++i) {
+        for (int h = 0; h < 16; ++h) {
+            memcpy(query_state[i][h], &qg_proj[i][512 * h], 256 * sizeof(__bf16));
+            memcpy(&gate[i][h * 256], &qg_proj[i][512 * h + 256], 256 * sizeof(__bf16));
+        }
+    }
+
+    volatile int dummy = 0;
+
+#if 0
     /* separate query and gate */
     struct query_gate *qg = (struct query_gate *)r->qg;
     for (int i = 0; i < 16; ++i) {
@@ -806,6 +823,7 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
 
     /* attn_output = self.o_proj(attn_output) */
     matmul(y, x, ow, attn_sz, p->hidden_size);
+#endif
 }
 
 struct qkvz {
@@ -1750,11 +1768,7 @@ int main() {
             }
 
             if (m->layers[k].q_proj_w) {
-#if 0
-                for (int i = 0; i < n; ++i) {
-                    self_attention((*emb)[i], (*emb2)[i], x, k, pos, sin, cos);
-                }
-#endif
+                self_attention(emb, emb2, x, k, n, sin, cos);
             } else {
                 /* core_attn_out is 32x128, and we allocated 16x256 ... */
                 linear_attention(emb, emb2, x, k, n, sin, cos, prefill);
