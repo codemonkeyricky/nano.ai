@@ -685,7 +685,7 @@ void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const st
 
 __bf16 qg_proj[64][8192];
 
-__bf16 query_state[64][16][256];
+__bf16 query_state[16][64][256];
 __bf16 gate[64][4096];
 
 void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
@@ -721,27 +721,21 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
 
     for (int i = 0; i < n; ++i) {
         for (int h = 0; h < 16; ++h) {
-            memcpy(query_state[i][h], &qg_proj[i][512 * h], 256 * sizeof(__bf16));
+            memcpy(query_state[h][i], &qg_proj[i][512 * h], 256 * sizeof(__bf16));
             memcpy(&gate[i][h * 256], &qg_proj[i][512 * h + 256], 256 * sizeof(__bf16));
+        }
+    }
+
+    /* query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2) */
+    for (int h = 0; h < 16; ++h) {
+        for (int i = 0; i < n; ++i) {
+            layernorm_n(query_state[h][i], query_state[i][h], m->layers[layer].q_norm, 256, xfmr);
         }
     }
 
     volatile int dummy = 0;
 
 #if 0
-    /* separate query and gate */
-    struct query_gate *qg = (struct query_gate *)r->qg;
-    for (int i = 0; i < 16; ++i) {
-        memcpy(r->q + i * 256, qg[i].q, 256 * sizeof(__bf16));
-        memcpy(r->gate + i * 256, qg[i].gate, 256 * sizeof(__bf16));
-    }
-
-    /* query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2) */
-    struct projection *query_state = (struct projection *)r->q;
-    for (int h = 0; h < 16; ++h) {
-        layernorm_n(query_state[h].block, query_state[h].block, m->layers[layer].q_norm, 256, xfmr);
-    }
-
     /* key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2) */
     matmul(r->k, x, kw, 2048, 512);
     struct projection *key_states = (struct projection *)r->k;
