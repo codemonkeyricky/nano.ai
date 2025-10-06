@@ -1673,6 +1673,13 @@ void softmax(float *scores, size_t n) {
     }
 }
 
+__bf16 mlp[64][4096] __attribute__((aligned(64)));
+__bf16 mlp1[4096] __attribute__((aligned(64)));
+__bf16 mlp2[4096] __attribute__((aligned(64)));
+__bf16 mlp3[4096] __attribute__((aligned(64)));
+__bf16 mlp4[4096] __attribute__((aligned(64)));
+__bf16 expert_output[4096] __attribute__((aligned(64)));
+
 int main() {
 
     struct Transformer xfmr = {};
@@ -1693,12 +1700,6 @@ int main() {
     __bf16 emb2[64][2048] __attribute__((aligned(64)));
     __bf16 emb3[64][2048] __attribute__((aligned(64)));
     __bf16 emb4[64][2048] __attribute__((aligned(64)));
-
-    __bf16 mlp[64][4096] __attribute__((aligned(64)));
-    __bf16 mlp2[4096] __attribute__((aligned(64)));
-    __bf16 mlp3[4096] __attribute__((aligned(64)));
-    __bf16 mlp4[4096] __attribute__((aligned(64)));
-    __bf16 expert_output[4096] __attribute__((aligned(64)));
 
     int stop_tokens[3] = {151645, 151644, 151643};
 
@@ -1773,58 +1774,115 @@ int main() {
                 layernorm(emb[i], emb2[i], m->layers[k].post_attn_layernorm, x);
             }
 
-            /* TOO: verified to here */
-
+            /* gate projection to find experts */
             for (int i = 0; i < n; ++i) {
-                /* gate projection to find experts */
                 matmul(mlp[i], emb[i], m->layers[k].gate, 2048, 512);
             }
 
+            /* top k experts */
+            struct ExpertRank ranks[64][c->num_experts];
             for (int i = 0; i < n; ++i) {
-                struct ExpertRank ranks[c->num_experts];
                 for (size_t j = 0; j < c->num_experts; ++j) {
-                    ranks[j].index = j;
-                    ranks[j].score = (float)mlp[i][j];
+                    ranks[i][j].index = j;
+                    ranks[i][j].score = (float)mlp[i][j];
                 }
+                qsort(ranks[i], c->num_experts, sizeof(struct ExpertRank), compare_expert_rank_desc);
+            }
 
-                qsort(ranks, c->num_experts, sizeof(struct ExpertRank), compare_expert_rank_desc);
+            /* softmax over top k experts */
+            float routing_weights[64][c->num_experts_per_token] = {};
+            for (int i = 0; i < n; ++i) {
+                for (size_t j = 0; j < c->num_experts_per_token; ++j) {
+                    routing_weights[i][j] = ranks[i][j].score;
+                }
+                softmax(routing_weights[i], c->num_experts_per_token);
+            }
 
+            int tpe[512][64] = {};
+            int tpe_cnt[512] = {};
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < 10; ++j) {
+                    int expert = ranks[i][j].index;
+                    tpe[expert][tpe_cnt[expert]++] = i + 1;
+                }
+            }
+
+            __bf16 final_hidden[64][2048] __attribute__((aligned(64))) = {};
+
+            for (int ex = 0; ex < 512; ++ex) {
+                for (int t = 0; t < tpe_cnt[ex]; ++t) {
+                    int i = tpe[ex][t] - 1;
+
+                    /* gate projection */
+                    matmul(mlp1, emb[i], m->layers[k].experts[ex].gate_proj, 2048, 512);
+                    silu_array(mlp2, mlp1, 512);
+
+                    /* up projection */
+                    matmul(mlp3, emb[i], m->layers[k].experts[ex].up_proj, 2048, 512);
+
+                    /* hidden */
+                    mul(mlp1, mlp2, mlp3, 512);
+
+                    /* down */
+                    __bf16 final[2048] = {};
+                    matmul(final, mlp1, m->layers[k].experts[ex].down_proj, 512, 2048);
+
+                    /* search through the top k experts for this token to find the routing */
+                    int routing = -1;
+                    for (int j = 0; j < 10; ++j) {
+                        if (ranks[i][j].index == ex) {
+                            routing = j;
+                            break;
+                        }
+                    }
+
+                    /* scale by routing weight */
+                    float scale = routing_weights[i][routing];
+                    for (int j = 0; j < 2048; ++j) {
+                        final[j] *= scale;
+                    }
+
+                    /* accumulate */
+                    for (int j = 0; j < 2048; ++j) {
+                        final_hidden[i][j] += final[j];
+                    }
+                }
+            }
+
+            for (int i = 0; i < n; ++i) {
+
+#if 0
                 __bf16 experts[c->num_experts_per_token][c->hidden_size] __attribute__((aligned(64))) = {};
 
                 for (size_t kk = 0; kk < c->num_experts_per_token; ++kk) {
 
-                    int ex = ranks[kk].index;
+                    int ex = ranks[i][kk].index;
 
                     /* gate projection */
-                    matmul(mlp[i], emb[i], m->layers[k].experts[ex].gate_proj, c->hidden_size, c->moe_intermediate_size);
-                    silu_array(mlp2, mlp[i], c->moe_intermediate_size);
+                    matmul(mlp[i], emb[i], m->layers[k].experts[ex].gate_proj, 2048, 512);
+                    silu_array(mlp2, mlp[i], 512);
 
                     /* up projection */
-                    matmul(mlp3, emb[i], m->layers[k].experts[ex].up_proj, c->hidden_size, c->moe_intermediate_size);
+                    matmul(mlp3, emb[i], m->layers[k].experts[ex].up_proj, 2048, 512);
 
                     /* hidden */
-                    mul(mlp[i], mlp2, mlp3, c->moe_intermediate_size);
+                    mul(mlp[i], mlp2, mlp3, 512);
 
                     /* down */
-                    matmul(experts[kk], mlp[i], m->layers[k].experts[ex].down_proj, c->moe_intermediate_size,
-                           c->hidden_size);
+                    matmul(experts[kk], mlp[i], m->layers[k].experts[ex].down_proj, 512, 2048);
                 }
-
-                float top_scores[c->num_experts_per_token] = {};
-                for (size_t i = 0; i < c->num_experts_per_token; ++i) {
-                    top_scores[i] = ranks[i].score;
-                }
-                softmax(top_scores, c->num_experts_per_token);
 
                 __bf16 combined[c->hidden_size] = {};
                 for (size_t k = 0; k < c->num_experts_per_token; ++k) {
                     for (size_t kk = 0; kk < c->hidden_size; ++kk) {
-                        combined[kk] += (__bf16)(top_scores[k] * (float)experts[k][kk]);
+                        combined[kk] += (__bf16)(routing_weights[i][k] * (float)experts[k][kk]);
                     }
                 }
+#endif
 
                 /* shared_expert_output = self.shared_expert(hidden_states) */
 
+#if 0
                 /* gate projection + silu */
                 matmul(mlp[i], emb[i], m->layers[k].shared_expert->gate_proj, c->hidden_size, c->moe_intermediate_size);
                 silu_array(mlp2, mlp[i], c->moe_intermediate_size);
@@ -1855,6 +1913,7 @@ int main() {
                 add(emb2[i], combined, emb[i], c->hidden_size);
 
                 add(emb[i], emb2[i], residual[i], c->hidden_size);
+#endif
             }
         }
 
