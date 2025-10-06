@@ -1694,7 +1694,7 @@ int main() {
     __bf16 emb3[64][2048] __attribute__((aligned(64)));
     __bf16 emb4[64][2048] __attribute__((aligned(64)));
 
-    __bf16 mlp[4096] __attribute__((aligned(64)));
+    __bf16 mlp[64][4096] __attribute__((aligned(64)));
     __bf16 mlp2[4096] __attribute__((aligned(64)));
     __bf16 mlp3[4096] __attribute__((aligned(64)));
     __bf16 mlp4[4096] __attribute__((aligned(64)));
@@ -1777,12 +1777,14 @@ int main() {
 
             for (int i = 0; i < n; ++i) {
                 /* gate projection to find experts */
-                matmul(mlp, emb[i], m->layers[k].gate, 2048, 512);
+                matmul(mlp[i], emb[i], m->layers[k].gate, 2048, 512);
+            }
 
+            for (int i = 0; i < n; ++i) {
                 struct ExpertRank ranks[c->num_experts];
-                for (size_t i = 0; i < c->num_experts; ++i) {
-                    ranks[i].index = i;
-                    ranks[i].score = (float)mlp[i];
+                for (size_t j = 0; j < c->num_experts; ++j) {
+                    ranks[j].index = j;
+                    ranks[j].score = (float)mlp[i][j];
                 }
 
                 qsort(ranks, c->num_experts, sizeof(struct ExpertRank), compare_expert_rank_desc);
@@ -1794,17 +1796,17 @@ int main() {
                     int ex = ranks[kk].index;
 
                     /* gate projection */
-                    matmul(mlp, emb[i], m->layers[k].experts[ex].gate_proj, c->hidden_size, c->moe_intermediate_size);
-                    silu_array(mlp2, mlp, c->moe_intermediate_size);
+                    matmul(mlp[i], emb[i], m->layers[k].experts[ex].gate_proj, c->hidden_size, c->moe_intermediate_size);
+                    silu_array(mlp2, mlp[i], c->moe_intermediate_size);
 
                     /* up projection */
                     matmul(mlp3, emb[i], m->layers[k].experts[ex].up_proj, c->hidden_size, c->moe_intermediate_size);
 
                     /* hidden */
-                    mul(mlp, mlp2, mlp3, c->moe_intermediate_size);
+                    mul(mlp[i], mlp2, mlp3, c->moe_intermediate_size);
 
                     /* down */
-                    matmul(experts[kk], mlp, m->layers[k].experts[ex].down_proj, c->moe_intermediate_size,
+                    matmul(experts[kk], mlp[i], m->layers[k].experts[ex].down_proj, c->moe_intermediate_size,
                            c->hidden_size);
                 }
 
@@ -1824,14 +1826,14 @@ int main() {
                 /* shared_expert_output = self.shared_expert(hidden_states) */
 
                 /* gate projection + silu */
-                matmul(mlp, emb[i], m->layers[k].shared_expert->gate_proj, c->hidden_size, c->moe_intermediate_size);
-                silu_array(mlp2, mlp, c->moe_intermediate_size);
+                matmul(mlp[i], emb[i], m->layers[k].shared_expert->gate_proj, c->hidden_size, c->moe_intermediate_size);
+                silu_array(mlp2, mlp[i], c->moe_intermediate_size);
 
                 /* up projection */
-                matmul(mlp, emb[i], m->layers[k].shared_expert->up_proj, c->hidden_size, c->moe_intermediate_size);
+                matmul(mlp[i], emb[i], m->layers[k].shared_expert->up_proj, c->hidden_size, c->moe_intermediate_size);
 
                 /* product */
-                mul(mlp3, mlp2, mlp, c->moe_intermediate_size);
+                mul(mlp3, mlp2, mlp[i], c->moe_intermediate_size);
 
                 /* down projection  */
                 matmul(emb2[i], mlp3, m->layers[k].shared_expert->down_proj, c->moe_intermediate_size, c->hidden_size);
