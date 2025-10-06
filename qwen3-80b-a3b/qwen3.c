@@ -1679,6 +1679,7 @@ __bf16 mlp2[4096] __attribute__((aligned(64)));
 __bf16 mlp3[4096] __attribute__((aligned(64)));
 __bf16 mlp4[4096] __attribute__((aligned(64)));
 __bf16 expert_output[4096] __attribute__((aligned(64)));
+__bf16 seo[64][2048] __attribute__((aligned(64)));
 
 int main() {
 
@@ -1851,69 +1852,46 @@ int main() {
 
             for (int i = 0; i < n; ++i) {
 
-#if 0
-                __bf16 experts[c->num_experts_per_token][c->hidden_size] __attribute__((aligned(64))) = {};
-
-                for (size_t kk = 0; kk < c->num_experts_per_token; ++kk) {
-
-                    int ex = ranks[i][kk].index;
-
-                    /* gate projection */
-                    matmul(mlp[i], emb[i], m->layers[k].experts[ex].gate_proj, 2048, 512);
-                    silu_array(mlp2, mlp[i], 512);
-
-                    /* up projection */
-                    matmul(mlp3, emb[i], m->layers[k].experts[ex].up_proj, 2048, 512);
-
-                    /* hidden */
-                    mul(mlp[i], mlp2, mlp3, 512);
-
-                    /* down */
-                    matmul(experts[kk], mlp[i], m->layers[k].experts[ex].down_proj, 512, 2048);
-                }
-
-                __bf16 combined[c->hidden_size] = {};
-                for (size_t k = 0; k < c->num_experts_per_token; ++k) {
-                    for (size_t kk = 0; kk < c->hidden_size; ++kk) {
-                        combined[kk] += (__bf16)(routing_weights[i][k] * (float)experts[k][kk]);
-                    }
-                }
-#endif
-
                 /* shared_expert_output = self.shared_expert(hidden_states) */
 
-#if 0
                 /* gate projection + silu */
-                matmul(mlp[i], emb[i], m->layers[k].shared_expert->gate_proj, c->hidden_size, c->moe_intermediate_size);
-                silu_array(mlp2, mlp[i], c->moe_intermediate_size);
+                matmul(mlp1, emb[i], m->layers[k].shared_expert->gate_proj, c->hidden_size, c->moe_intermediate_size);
+                silu_array(mlp2, mlp1, c->moe_intermediate_size);
 
                 /* up projection */
-                matmul(mlp[i], emb[i], m->layers[k].shared_expert->up_proj, c->hidden_size, c->moe_intermediate_size);
+                matmul(mlp1, emb[i], m->layers[k].shared_expert->up_proj, c->hidden_size, c->moe_intermediate_size);
 
                 /* product */
-                mul(mlp3, mlp2, mlp[i], c->moe_intermediate_size);
+                mul(mlp3, mlp2, mlp1, c->moe_intermediate_size);
 
                 /* down projection  */
-                matmul(emb2[i], mlp3, m->layers[k].shared_expert->down_proj, c->moe_intermediate_size, c->hidden_size);
+                matmul(seo[i], mlp3, m->layers[k].shared_expert->down_proj, c->moe_intermediate_size, c->hidden_size);
+            }
 
-                /*
-                 * embeddings -> hidden
-                 * embeddings2 -> shared_expert_output
-                 */
+            /*
+             * embeddings -> hidden
+             * embeddings2 -> shared_expert_output
+             */
 
+            __bf16 gate[64] = {};
+            for (int i = 0; i < n; ++i) {
                 /* shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output */
                 /* gate projection */
-                __bf16 gate = 0;
-                matmul(&gate, emb[i], m->layers[k].shared_expert->gate, 2048, 1);
-                gate = sigmoid(gate);
+                matmul(&gate[i], emb[i], m->layers[k].shared_expert->gate, 2048, 1);
+                gate[i] = sigmoid(gate[i]);
+            }
 
-                mul_scalar(emb[i], emb2[i], gate, c->hidden_size);
+            for (int i = 0; i < n; ++i) {
+                mul_scalar(seo[i], seo[i], gate[i], c->hidden_size);
+            }
 
+            for (int i = 0; i < n; ++i) {
                 /* final_hidden_states = final_hidden_states + shared_expert_output */
-                add(emb2[i], combined, emb[i], c->hidden_size);
+                add(final_hidden[i], final_hidden[i], seo[i], c->hidden_size);
+            }
 
-                add(emb[i], emb2[i], residual[i], c->hidden_size);
-#endif
+            for (int i = 0; i < n; ++i) {
+                add(emb[i], final_hidden[i], residual[i], c->hidden_size);
             }
         }
 
