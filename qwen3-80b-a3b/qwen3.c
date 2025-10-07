@@ -653,7 +653,7 @@ void rotate_half(__bf16 *out, const __bf16 *x, int D) {
     }
 }
 
-void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const struct Transformer *x, int heads) {
+void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const struct Transformer *x) {
 
     __bf16 *in = emb; //  *out = x->runtime.h1, *out2 = x->runtime.h2, *out3 = x->runtime.h3;
     __bf16 out[256], out2[256], out3[256];
@@ -666,6 +666,7 @@ void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const st
     int n = x->config.head_dim;
 
     /* Apply rotary positional embedding for all heads */
+    int heads = 1;
     for (int h = 0; h < heads; h++) {
         in = emb + h * n;
 
@@ -684,8 +685,8 @@ void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const st
 }
 
 __bf16 qg_proj[64][8192];
-__bf16 query_state[16][64][256];
 __bf16 gate[64][4096];
+__bf16 query_state[16][64][256];
 __bf16 key_state[2][64][256];
 __bf16 value_state[2][64][256];
 
@@ -746,8 +747,8 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
         }
 
         /* normalization */
-        for (int i = 0; i < n; ++i) {
-            for (int h = 0; h < 2; ++h) {
+        for (int h = 0; h < 2; ++h) {
+            for (int i = 0; i < n; ++i) {
                 layernorm_n(key_state[h][i], key_state[h][i], m->layers[layer].k_norm, 256, xfmr);
             }
         }
@@ -765,6 +766,86 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
         }
     }
 
+    for (int h = 0; h < 16; ++h) {
+        for (int i = 0; i < n; ++i) {
+            rotary_positional_embedding(query_state[h][i], cos[i], sin[i], xfmr);
+        }
+    }
+
+    for (int h = 0; h < 2; ++h) {
+        for (int i = 0; i < n; ++i) {
+            rotary_positional_embedding(key_state[h][i], cos[i], sin[i], xfmr);
+        }
+    }
+
+    // __bf16 query_state[16][64][256];
+    // __bf16 key_state[2][64][256];
+    // __bf16 value_state[2][64][256];
+
+    __bf16 attn[16][64][64] = {};
+
+    /* att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) */
+    for (int h = 0; h < 16; ++h) {
+        for (int i = 0; i < n; ++i) {
+            /* 1x256 @ 64x256 */
+            matmul(attn[h][i], query_state[h][i], (__bf16 *)key_state[h / 8], 256, 64);
+        }
+    }
+
+    /* scale */
+    for (int h = 0; h < 16; ++h) {
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < 64; ++j) {
+                attn[h][i][j] = attn[h][i][j] / sqrtf(256) * 0.0625f;
+            }
+        }
+    }
+
+    /* clear upper right for easier debug */
+    for (int h = 0; h < 16; ++h) {
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < 64; ++j) {
+                attn[h][i][j] = 0;
+            }
+        }
+    }
+
+    /* soft max */
+    for (int h = 0; h < 16; ++h) {
+        for (int i = 0; i < n; ++i) {
+            float max_att = attn[h][i][0];
+            for (int j = 0; j <= i; j++) {
+                if (attn[h][i][j] > max_att)
+                    max_att = attn[h][i][j];
+            }
+            float sum_exp = 0.0f;
+            for (int j = 0; j <= i; j++) {
+                attn[h][i][j] = expf(attn[h][i][j] - max_att);
+                sum_exp += attn[h][i][j];
+            }
+            for (int j = 0; j <= i; j++) {
+                attn[h][i][j] /= sum_exp;
+            }
+        }
+    }
+
+    /*
+    # manual implementation of attention
+    from torch.nn import functional as F
+    q = query
+    k = key
+    v = value
+    k_expanded = k.repeat_interleave(8, dim=1)
+    att = (q @ k_expanded.transpose(-2, -1)) * 0.0625
+    # TODO mask out upper triangle
+    seq_len = q.size(-2)
+    mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+    att = att.masked_fill(mask, float('-inf'))
+    att = F.softmax(att, dim=-1)
+    v_expanded = v.repeat_interleave(8, dim=1)
+    y = att @ v_expanded
+    */
+
     volatile int dummy = 0;
 
 #if 0
@@ -778,8 +859,6 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
     /* value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) */
     matmul(r->v, x, vw, 2048, 512);
 
-    rotary_positional_embedding(r->q, cos, sin, xfmr, 16);
-    rotary_positional_embedding(r->k, cos, sin, xfmr, 2);
 
     volatile int dummy = 0;
 
