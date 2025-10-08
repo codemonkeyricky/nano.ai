@@ -731,7 +731,7 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
     /* query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2) */
     for (int h = 0; h < 16; ++h) {
         for (int i = 0; i < n; ++i) {
-            layernorm_n(query_state[h][i], query_state[i][h], m->layers[layer].q_norm, 256, xfmr);
+            layernorm_n(query_state[h][i], query_state[h][i], m->layers[layer].q_norm, 256, xfmr);
         }
     }
 
@@ -782,49 +782,93 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
     // __bf16 key_state[2][64][256];
     // __bf16 value_state[2][64][256];
 
-    __bf16 attn[16][64][64] = {};
+    static float y[16][64][256];
+    {
+        static float q[16][64][256];
+        static float k[2][64][256];
+        static float v[2][64][256];
 
-    /* att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) */
-    for (int h = 0; h < 16; ++h) {
-        for (int i = 0; i < n; ++i) {
-            /* 1x256 @ 64x256 */
-            matmul(attn[h][i], query_state[h][i], (__bf16 *)key_state[h / 8], 256, 64);
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < 256; ++j) {
+                    q[h][i][j] = (float)query_state[h][i][j];
+                }
+            }
+        }
+
+        for (int h = 0; h < 2; ++h) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < 256; ++j) {
+                    k[h][i][j] = (float)key_state[h][i][j];
+                    v[h][i][j] = (float)value_state[h][i][j];
+                }
+            }
+        }
+
+        float attn[16][64][64] = {};
+
+        /* att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) */
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                /* 1x256 @ 64x256 */
+                matmul_f32(attn[h][i], q[h][i], (float *)k[h / 8], 256, 64);
+            }
+        }
+
+        /* scale */
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < 64; ++j) {
+                    attn[h][i][j] *= 0.0625f;
+                }
+            }
+        }
+
+        /* clear upper right for easier debug */
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = i + 1; j < 64; ++j) {
+                    attn[h][i][j] = 0;
+                }
+            }
+        }
+
+        /* soft max */
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                float max_att = attn[h][i][0];
+                for (int j = 0; j <= i; j++) {
+                    if (attn[h][i][j] > max_att)
+                        max_att = attn[h][i][j];
+                }
+                float sum_exp = 0.0f;
+                for (int j = 0; j <= i; j++) {
+                    attn[h][i][j] = expf(attn[h][i][j] - max_att);
+                    sum_exp += attn[h][i][j];
+                }
+                for (int j = 0; j <= i; j++) {
+                    attn[h][i][j] /= sum_exp;
+                }
+            }
+        }
+
+        /* attention is 16x64x64, v is 2x64x256 */
+        float v_t[2][256][64];
+        for (int h = 0; h < 2; ++h) {
+            transpose((float *)v_t[h], (float *)v[h], 64, 256);
+        }
+
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                matmul_f32((float *)y[h][i], attn[h][i], (float *)v_t[h / 8], 64, 256);
+            }
         }
     }
 
-    /* scale */
     for (int h = 0; h < 16; ++h) {
         for (int i = 0; i < n; ++i) {
-            for (int j = 0; j < 64; ++j) {
-                attn[h][i][j] = attn[h][i][j] / sqrtf(256) * 0.0625f;
-            }
-        }
-    }
-
-    /* clear upper right for easier debug */
-    for (int h = 0; h < 16; ++h) {
-        for (int i = 0; i < n; ++i) {
-            for (int j = i + 1; j < 64; ++j) {
-                attn[h][i][j] = 0;
-            }
-        }
-    }
-
-    /* soft max */
-    for (int h = 0; h < 16; ++h) {
-        for (int i = 0; i < n; ++i) {
-            float max_att = attn[h][i][0];
-            for (int j = 0; j <= i; j++) {
-                if (attn[h][i][j] > max_att)
-                    max_att = attn[h][i][j];
-            }
-            float sum_exp = 0.0f;
-            for (int j = 0; j <= i; j++) {
-                attn[h][i][j] = expf(attn[h][i][j] - max_att);
-                sum_exp += attn[h][i][j];
-            }
-            for (int j = 0; j <= i; j++) {
-                attn[h][i][j] /= sum_exp;
+            for (int j = 0; j < 256; ++j) {
+                xout[i][h * 256 + j] = (__bf16)y[h][i][j];
             }
         }
     }
@@ -846,89 +890,17 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
     y = att @ v_expanded
     */
 
-    volatile int dummy = 0;
-
-#if 0
-    /* key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2) */
-    matmul(r->k, x, kw, 2048, 512);
-    struct projection *key_states = (struct projection *)r->k;
-    for (int h = 0; h < 2; ++h) {
-        layernorm_n(key_states[h].block, key_states[h].block, m->layers[layer].k_norm, 256, xfmr);
-    }
-
-    /* value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) */
-    matmul(r->v, x, vw, 2048, 512);
-
-
-    volatile int dummy = 0;
-
-    /* insert to kv cache */
-    int attn_sz = p->n_heads * p->head_dim;
-    int sz = p->kv_heads * p->head_dim;
-
-    int n_heads = p->n_heads, kv_heads = p->kv_heads;
-    int hs = attn_sz / p->n_heads;
-    int index = n_heads / kv_heads;
-    for (size_t h = 0; h < kv_heads; h++) {
-        memcpy(r->layers[layer].key_cache[h].cache + pos * hs, r->k + h * hs, hs * sizeof(__bf16));
-        /* value is transposed to simply dot product with query */
-        for (size_t k = 0; k < hs; ++k) {
-            *(r->layers[layer].value_cache[h].cache + p->max_position_embeddings * k + pos) = r->v[h * hs + k];
-        }
-    }
-
-    /* Calculate attention score */
-    __bf16 att[(pos + 1 + 31) / 32 * 32] = {};
-    __bf16 *y = xout;
-    memset(y, 0, attn_sz * sizeof(__bf16)); // clear output buffer
-
-    for (int h = 0; h < p->n_heads; h++) {
-
-        /* current token query at head h */
-        const __bf16 *qq = r->q + h * hs; // (1, hs)
-        for (int t = 0; t <= pos; t++) {
-            /* send query to all previous keys including current */
-            __bf16 *kk = r->layers[layer].key_cache[h / index].cache + t * hs; // (T, hs)
-            att[t] = dot(qq, kk, hs);
-        }
-
-        /* normalize */
-        for (int t = 0; t <= pos; t++) {
-            att[t] = att[t] / sqrtf(hs) * 0.0625f;
-        }
-
-        /* soft max */
-        float max_att = att[0];
-        for (int t = 1; t <= pos; t++) {
-            if (att[t] > max_att)
-                max_att = att[t];
-        }
-        float sum_exp = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            att[t] = expf(att[t] - max_att);
-            sum_exp += att[t];
-        }
-        for (int t = 0; t <= pos; t++) {
-            att[t] /= sum_exp;
-        }
-
-        /* y = att @ v // (1, T) x (T, hs) -> (1, hs) */
-        for (int i = 0; i < hs; i++) {
-            __bf16 *vv = r->layers[layer].value_cache[h / index].cache;
-            __bf16 *yy = y + h * hs; // (1, hs)
-            /* find v for the current head */
-            yy[i] += dot(att, &vv[i * p->max_position_embeddings], (pos + 1 + 31) / 32 * 32);
-        }
-    }
-
     /* attn_output = attn_output * torch.sigmoid(gate) */
-    for (int i = 0; i < attn_sz; i++) {
-        x[i] = y[i] * sigmoid(r->gate[i]);
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < 4096; j++) {
+            x[i][j] = xout[i][j] * sigmoid(gate[i][j]);
+        }
     }
 
     /* attn_output = self.o_proj(attn_output) */
-    matmul(y, x, ow, attn_sz, p->hidden_size);
-#endif
+    for (int i = 0; i < n; ++i) {
+        matmul(xout[i], x[i], ow, 4096, 2048);
+    }
 }
 
 struct qkvz {
