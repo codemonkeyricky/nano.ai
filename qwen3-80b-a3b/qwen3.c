@@ -653,34 +653,24 @@ void rotate_half(__bf16 *out, const __bf16 *x, int D) {
     }
 }
 
-void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const struct Transformer *x) {
+void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin) {
+    int n = 64;
 
-    __bf16 *in = emb; //  *out = x->runtime.h1, *out2 = x->runtime.h2, *out3 = x->runtime.h3;
-    __bf16 out[256], out2[256], out3[256];
-    __bf16 cos_padded[256], sin_padded[256];
-    for (int i = 0; i < 4; ++i) {
-        memcpy(&cos_padded[i * 64], cos, 64 * sizeof(__bf16));
-        memcpy(&sin_padded[i * 64], sin, 64 * sizeof(__bf16));
+    __bf16 first[64], second[64];
+    memcpy(first, emb, 64 * sizeof(__bf16));
+    memcpy(second, emb, 64 * sizeof(__bf16));
+
+    for (int i = 0; i < 64; ++i) {
+        first[i] *= cos[i];
     }
 
-    int n = x->config.head_dim;
+    rotate_half(second, second, 64);
+    for (int i = 0; i < 64; ++i) {
+        second[i] *= sin[i];
+    }
 
-    /* Apply rotary positional embedding for all heads */
-    int heads = 1;
-    for (int h = 0; h < heads; h++) {
-        in = emb + h * n;
-
-        /* a = rotate_half(q) * sin */
-        rotate_half(out, in, n);
-        mul(out2, out, sin_padded, n);
-
-        /* b = q * cos */
-        mul(out, in, cos_padded, n);
-
-        /* a + b */
-        add(out3, out, out2, n);
-
-        memcpy(emb + h * n, out3, n * sizeof(__bf16));
+    for (int i = 0; i < 64; ++i) {
+        emb[i] = first[i] + second[i];
     }
 }
 
@@ -768,13 +758,13 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
 
     for (int h = 0; h < 16; ++h) {
         for (int i = 0; i < n; ++i) {
-            rotary_positional_embedding(query_state[h][i], cos[i], sin[i], xfmr);
+            rotary_positional_embedding(query_state[h][i], cos[i], sin[i]);
         }
     }
 
     for (int h = 0; h < 2; ++h) {
         for (int i = 0; i < n; ++i) {
-            rotary_positional_embedding(key_state[h][i], cos[i], sin[i], xfmr);
+            rotary_positional_embedding(key_state[h][i], cos[i], sin[i]);
         }
     }
 
@@ -787,6 +777,8 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
         static float q[16][64][256];
         static float k[2][64][256];
         static float v[2][64][256];
+
+        memset(v, 0, sizeof(v));
 
         for (int h = 0; h < 16; ++h) {
             for (int i = 0; i < n; ++i) {
@@ -865,10 +857,14 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
         }
     }
 
+    static __bf16 tmp[64][16][256];
+    memset(tmp, 0, sizeof(tmp));
+
+    /* convert and transpose */
     for (int h = 0; h < 16; ++h) {
         for (int i = 0; i < n; ++i) {
             for (int j = 0; j < 256; ++j) {
-                xout[i][h * 256 + j] = (__bf16)y[h][i][j];
+                tmp[i][h][j] = (__bf16)y[h][i][j];
             }
         }
     }
@@ -890,16 +886,17 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
     y = att @ v_expanded
     */
 
+    static __bf16 tmp2[64][4096];
     /* attn_output = attn_output * torch.sigmoid(gate) */
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < 4096; j++) {
-            x[i][j] = xout[i][j] * sigmoid(gate[i][j]);
+            tmp2[i][j] = ((__bf16 *)tmp[i])[j] * sigmoid(gate[i][j]);
         }
     }
 
     /* attn_output = self.o_proj(attn_output) */
     for (int i = 0; i < n; ++i) {
-        matmul(xout[i], x[i], ow, 4096, 2048);
+        matmul(xout[i], tmp2[i], ow, 4096, 2048);
     }
 }
 
@@ -1775,6 +1772,7 @@ __bf16 mlp3[4096] __attribute__((aligned(64)));
 __bf16 mlp4[4096] __attribute__((aligned(64)));
 __bf16 expert_output[4096] __attribute__((aligned(64)));
 __bf16 seo[64][2048] __attribute__((aligned(64)));
+__bf16 logits[64][151936] = {};
 
 int main() {
 
@@ -1984,16 +1982,20 @@ int main() {
             for (int i = 0; i < n; ++i) {
                 add(emb[i], final_hidden[i], residual[i], c->hidden_size);
             }
+
+            volatile int z = 0;
+        }
+
+        for (int i = 0; i < n; ++i) {
+            layernorm(emb2[i], emb[i], m->final_layernorm, x);
+        }
+
+        const __bf16 *weights = !m->lm_head ? m->embeddings : m->lm_head;
+        for (int i = 0; i < n; ++i) {
+            matmul(logits[i], emb2[i], weights, c->hidden_size, c->vocab_size);
         }
 
 #if 0
-        layernorm(embeddings2, embeddings, m->final_layernorm, x);
-
-        __bf16 logits[c->vocab_size] = {};
-
-        const __bf16 *weights = !m->lm_head ? m->embeddings : m->lm_head;
-        matmul(logits, embeddings2, weights, c->hidden_size, c->vocab_size);
-
         // Generate prediction: pick argmax from logits
         int predict = 0;
         float max = (float)logits[0];
