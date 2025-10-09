@@ -991,46 +991,34 @@ void rmsnorm_gated(__bf16 *xout, __bf16 *tmp, __bf16 *zz, __bf16 *w, int n_heads
     }
 }
 
-// #pragma GCC push_options
-// #pragma GCC optimize("O0")
+#pragma GCC push_options
+#pragma GCC optimize("O0")
 
-void recurrent_gated_delta_rule(float g[32][64], float beta[64][32], int layer, int pos, int n,
-                                const struct Transformer *xfmr) {
+void recurrent_gated_delta_rule(float q[32][128], float k[32][128], float v[32][128], float g[32], float beta[32],
+                                int layer, int pos, int n, const struct Transformer *xfmr) {
     const struct Config *c = &xfmr->config;
     struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
 
-    int chunk = pos / 64;
-    // int chunk = 0; /* TODO: hack */
-    int offset = pos % 64;
-
-    /* r->layers[layer].query */
-    /* float *v_cache = r->layers[layer].v_cache[chunk].attn[h][offset]; */
-    /* float *k_cache = r->layers[layer].k_cache[chunk].attn[h][offset]; */
-    /* g */
-    /* beta */
-
-#if 0
     float g_exp[32] = {};
-    for (int i = 0; i < 32; ++i) {
-        g_exp[i] = expf(g[i]);
+    for (int h = 0; h < 32; ++h) {
+        g_exp[h] = expf(g[h]);
     }
 
     /* last_recurrent_state = last_recurrent_state * g_t */
     for (int h = 0; h < 32; ++h) {
-        float *recurrent = (float *)r->layers[layer].last_recurrent_state->decay[h]; /* 128x128 */
+        float *recurrent = (float *)r->layers[layer].last_recurrent_state[h]; /* 128x128 */
         for (int j = 0; j < 128 * 128; ++j) {
             recurrent[j] *= g_exp[h];
         }
     }
 
-    struct RecurrentState kv_mem_tmp = {};
+    float kv_mem_tmp[32][128][128] = {};
     for (int h = 0; h < 32; ++h) {
-        float (*recurrent)[128] = r->layers[layer].last_recurrent_state->decay[h]; /* 128x128 */
-        float *k_t = r->layers[layer].k_cache[chunk].attn[h][offset];
+        float (*recurrent)[128] = r->layers[layer].last_recurrent_state[h]; /* 128x128 */
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
-                kv_mem_tmp.decay[h][i][j] = k_t[i] * recurrent[i][j];
+                kv_mem_tmp[h][i][j] = k[h][i] * recurrent[i][j];
             }
         }
     }
@@ -1039,16 +1027,17 @@ void recurrent_gated_delta_rule(float g[32][64], float beta[64][32], int layer, 
     for (int h = 0; h < 32; ++h) {
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
-                kv_mem[h][j] += kv_mem_tmp.decay[h][i][j];
+                kv_mem[h][j] += kv_mem_tmp[h][i][j];
             }
         }
     }
 
-    float delta[32][128] = {};
-    struct ProjectionChunk *v_cache = &r->layers[layer].v_cache[chunk];
+    /* verified? */
+
+    static float delta[32][128] = {};
     for (int h = 0; h < 32; ++h) {
         for (int j = 0; j < 128; ++j) {
-            delta[h][j] = v_cache->attn[h][offset][j] - kv_mem[h][j];
+            delta[h][j] = v[h][j] - kv_mem[h][j];
         }
     }
 
@@ -1058,9 +1047,9 @@ void recurrent_gated_delta_rule(float g[32][64], float beta[64][32], int layer, 
         }
     }
 
-    float tmp[32][128][128] = {};
+    static float tmp[32][128][128] = {};
     for (int h = 0; h < 32; ++h) {
-        float *k_t = r->layers[layer].k_cache[chunk].attn[h][offset];
+        float *k_t = k[h];
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
                 tmp[h][i][j] = k_t[i] * delta[h][j];
@@ -1069,7 +1058,7 @@ void recurrent_gated_delta_rule(float g[32][64], float beta[64][32], int layer, 
     }
 
     for (int h = 0; h < 32; ++h) {
-        float (*recurrent)[128] = r->layers[layer].last_recurrent_state->decay[h]; /* 128x128 */
+        float (*recurrent)[128] = r->layers[layer].last_recurrent_state[h]; /* 128x128 */
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
                 recurrent[i][j] += tmp[h][i][j];
@@ -1077,9 +1066,8 @@ void recurrent_gated_delta_rule(float g[32][64], float beta[64][32], int layer, 
         }
     }
 
-    float (*q)[128] = (float (*)[128])r->layers[layer].query;                                  /* 32x128 */
     float (*recurrent)[128][128] = (float (*)[128][128])r->layers[layer].last_recurrent_state; /* 32x128x128 */
-    float core_tmp[32][128][128] = {};
+    static float core_tmp[32][128][128] = {};
 
     for (int h = 0; h < 32; ++h) {
         for (int i = 0; i < 128; ++i) {
@@ -1089,18 +1077,19 @@ void recurrent_gated_delta_rule(float g[32][64], float beta[64][32], int layer, 
         }
     }
 
-    float (*core)[64][128] = (float (*)[64][128]) & r->layers[layer].core_attn_out[chunk]; /* 32x64x128 */
+    float (*core)[64][128] = (float (*)[64][128]) & r->layers[layer].core_attn_out; /* 32x64x128 */
     for (int h = 0; h < 32; ++h) {
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
-                core[h][offset][j] += core_tmp[h][i][j];
+                core[h][0][j] += core_tmp[h][i][j];
             }
         }
     }
-#endif
+
+    volatile int dummy = 0;
 }
 
-// #pragma GCC pop_options
+#pragma GCC pop_options
 
 void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
                       const int p, const int n, __bf16 sin[64][64], __bf16 cos[64][64], int prefill) {
@@ -1581,7 +1570,14 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     } else {
         /* recurrent gated delta rule */
-        recurrent_gated_delta_rule(g, beta, layer, p, n, xfmr);
+
+        float gg[32];
+        for (int h = 0; h < 32; ++h) {
+            gg[h] = g[h][0];
+        }
+
+        recurrent_gated_delta_rule((float (*)[128])q, (float (*)[128])k, (float (*)[128])v, gg, beta[0], layer, p, 1,
+                                   xfmr);
     }
 
     /* convert back to bf16 */
