@@ -117,7 +117,7 @@ struct RLayer {
     Head *value_cache;
 
     /* linear attention */
-    __bf16 mixed_qkv_raw[64 + 4][8192]; /* +4 for the convolution kernel size */
+    __bf16 mixed_qkv_raw[64][8192]; /* +4 for the convolution kernel size */
     __bf16 mixed_qkv[64][8192];
     struct Projection *query;
     struct AttentionChunk *attn_cache;
@@ -994,7 +994,8 @@ void rmsnorm_gated(__bf16 *xout, __bf16 *tmp, __bf16 *zz, __bf16 *w, int n_heads
 // #pragma GCC push_options
 // #pragma GCC optimize("O0")
 
-void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const struct Transformer *xfmr) {
+void recurrent_gated_delta_rule(float g[32][64], float beta[64][32], int layer, int pos, int n,
+                                const struct Transformer *xfmr) {
     const struct Config *c = &xfmr->config;
     struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
@@ -1009,12 +1010,12 @@ void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const
     /* g */
     /* beta */
 
+#if 0
     float g_exp[32] = {};
     for (int i = 0; i < 32; ++i) {
         g_exp[i] = expf(g[i]);
     }
 
-#if 0
     /* last_recurrent_state = last_recurrent_state * g_t */
     for (int h = 0; h < 32; ++h) {
         float *recurrent = (float *)r->layers[layer].last_recurrent_state->decay[h]; /* 128x128 */
@@ -1102,7 +1103,7 @@ void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const
 // #pragma GCC pop_options
 
 void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
-                      const int n, __bf16 sin[64][64], __bf16 cos[64][64], int prefill) {
+                      const int p, const int n, __bf16 sin[64][64], __bf16 cos[64][64], int prefill) {
     const struct Config *c = &xfmr->config;
     struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
@@ -1125,7 +1126,9 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
     __bf16 (*raw)[8192] = r->layers[layer].mixed_qkv_raw;
 
-    for (int k = 0; k < n; ++k) {
+    for (int kk = p; kk < p + n; ++kk) {
+
+        int k = kk % 64;
 
         struct projected_qkvz *p_qkvz = (struct projected_qkvz *)(*qkvz)[k];
 
@@ -1152,7 +1155,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
     /* conv1d over qkv - 8192 dimensions */
     struct conv1d_w *w = (struct conv1d_w *)m->layers[layer].linear_attn_conv1d_w;
-    for (int pp = 0; pp < n; ++pp) {
+    for (int pp = p; pp < p + n; ++pp) {
         for (int i = 0; i < 8192; i++) {
             __bf16 tmp = 0;
             for (int k = 0; k < 4; ++k) {
@@ -1164,9 +1167,12 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     }
 
-    for (int pp = 0; pp < n; ++pp) {
+    for (int pp = p; pp < p + n; ++pp) {
+
+        int ppp = pp % 64;
+
         /* silu on all 8192 elements */
-        silu_array(mixed[pp], mixed[pp], 8192);
+        silu_array(mixed[ppp], mixed[ppp], 8192);
     }
 
     float beta[64][32] = {};
@@ -1210,7 +1216,9 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     }
 
-    for (int k = 0; k < n; ++k) {
+    for (int kk = p; kk < p + n; ++kk) {
+
+        int k = kk % 64;
 
         __bf16 *query, *key, *value;
         query = mixed[k] + 0;
@@ -1234,15 +1242,17 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
      */
 
     float q[64][4096] = {}, k[64][4096] = {}, v[64][4096] = {};
-    for (int p = 0; p < n; ++p) {
+    for (int pp = 0; pp < n; ++pp) {
+
+        int index = (p + pp) % 64;
 
         __bf16 *query, *key, *value;
-        query = mixed[p] + 0;
-        key = mixed[p] + 2048;
-        value = mixed[p] + 4096;
+        query = mixed[index] + 0;
+        key = mixed[index] + 2048;
+        value = mixed[index] + 4096;
 
         for (int i = 0; i < 4096; ++i) {
-            v[p][i] = value[i];
+            v[pp][i] = value[i];
         }
 
         float scale = 1.0f / sqrtf(128);
@@ -1250,8 +1260,8 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
             for (int i = 0; i < 128; ++i) {
                 int k1 = (h * 2 + 0) * 128 + i;
                 int k2 = (h * 2 + 1) * 128 + i;
-                k[p][k1] = k[p][k2] = key[h * 128 + i];
-                q[p][k1] = q[p][k2] = scale * (float)query[h * 128 + i]; /* scale query */
+                k[pp][k1] = k[pp][k2] = key[h * 128 + i];
+                q[pp][k1] = q[pp][k2] = scale * (float)query[h * 128 + i]; /* scale query */
             }
         }
     }
@@ -1571,7 +1581,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         }
     } else {
         /* recurrent gated delta rule */
-        // recurrent_gated_delta_rule(g, beta, layer, pos, xfmr);
+        recurrent_gated_delta_rule(g, beta, layer, p, n, xfmr);
     }
 
     /* convert back to bf16 */
@@ -1846,7 +1856,7 @@ int main() {
                 self_attention(emb, emb2, x, k, n, sin, cos);
             } else {
                 /* core_attn_out is 32x128, and we allocated 16x256 ... */
-                linear_attention(emb, emb2, x, k, n, sin, cos, prefill);
+                linear_attention(emb, emb2, x, k, pos, n, sin, cos, prefill);
             }
 
             /* residual connection */
