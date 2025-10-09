@@ -1995,32 +1995,32 @@ int main() {
             matmul(logits[i], emb2[i], weights, c->hidden_size, c->vocab_size);
         }
 
-#if 0
         // Generate prediction: pick argmax from logits
-        int predict = 0;
-        float max = (float)logits[0];
-        for (int i = 1; i < c->vocab_size; i++) {
-            if ((float)logits[i] > max) {
-                max = (float)logits[i];
-                predict = i;
+        int predict[64] = {};
+        for (int i = 0; i < n; ++i) {
+            float max = (float)logits[i][0];
+            for (int j = 1; j < c->vocab_size; j++) {
+                if ((float)logits[i][j] > max) {
+                    max = (float)logits[i][j];
+                    predict[i] = j;
+                }
             }
         }
-        if (tokens[pos + 1] == 0) {
-            tokens[pos + 1] = predict;
+        if (tokens[pos + n] == 0) {
+            tokens[pos + n] = predict[n - 1];
             prefill = 0;
 
-            if (tokens[pos + 1] == stop_tokens[0] || tokens[pos + 1] == stop_tokens[1] ||
-                tokens[pos + 1] == stop_tokens[2]) {
+            if (tokens[pos + n] == stop_tokens[0] || tokens[pos + 1] == stop_tokens[1] ||
+                tokens[pos + n] == stop_tokens[2]) {
                 // terminate if we see stop token
                 break;
             }
         }
 
-        printf("%s", x->runtime.lookup[tokens[pos + 1]]);
+        printf("%s", x->runtime.lookup[tokens[pos + n]]);
         fflush(stdout);
-#endif
 
-        ++pos;
+        pos += n;
     }
 
     clock_t end_time = clock(); // End timing
