@@ -153,8 +153,8 @@ struct Runtime {
     __bf16 *h1;
     __bf16 *h2;
     __bf16 *h3;
-    __bf16 *qkvz;
-    __bf16 *ba;
+    __bf16 qkvz[64][12288]; //
+    __bf16 ba[64][64];
     float (*g)[32]; // (*g)[64];
 
     struct RLayer *layers;
@@ -1077,7 +1077,8 @@ void recurrent_gated_delta_rule(float q[32][128], float k[32][128], float v[32][
         }
     }
 
-    float (*core)[64][128] = (float (*)[64][128]) & r->layers[layer].core_attn_out; /* 32x64x128 */
+    memset(r->layers[layer].core_attn_out, 0, sizeof(r->layers[layer].core_attn_out));
+    float (*core)[64][128] = (float (*)[64][128])r->layers[layer].core_attn_out; /* 32x64x128 */
     for (int h = 0; h < 32; ++h) {
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
@@ -1089,26 +1090,28 @@ void recurrent_gated_delta_rule(float q[32][128], float k[32][128], float v[32][
     volatile int dummy = 0;
 }
 
-#pragma GCC pop_options
-
 void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
                       const int p, const int n, __bf16 sin[64][64], __bf16 cos[64][64], int prefill) {
     const struct Config *c = &xfmr->config;
     struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
+
+    if (n == 1) {
+        volatile int dummy = 0;
+    }
     // int pp = pos % 4;
 
-    __bf16 (*qkvz)[64][12288] = (__bf16 (*)[64][12288])r->qkvz;
+    __bf16 (*qkvz)[12288] = (__bf16 (*)[12288])r->qkvz;
     __bf16 (*ba)[16][4] = (__bf16 (*)[16][4])r->ba;
 
     /* qkvz and ba projection */
     for (int i = 0; i < n; ++i) {
-        matmul((*qkvz)[i], x[i], m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
+        matmul(qkvz[(p + i) % 64], x[i], m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
     }
 
     /* ba is 64x(16x2x2) */
     for (int i = 0; i < n; ++i) {
-        matmul((__bf16 *)ba[i], x[i], m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
+        matmul((__bf16 *)ba[(p + i) % 64], x[i], m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
     }
 
     /* Convert from interleaved to concatenated format */
@@ -1119,7 +1122,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
         int k = kk % 64;
 
-        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)(*qkvz)[k];
+        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)qkvz[k];
 
         for (int i = 0; i < 16; i++) {
             for (int j = 0; j < 128; j++) {
@@ -1230,7 +1233,12 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
      * Convert qkv floats
      */
 
-    float q[64][4096] = {}, k[64][4096] = {}, v[64][4096] = {};
+    static float q[64][4096] = {};
+    static float k[64][4096] = {};
+    static float v[64][4096] = {};
+    memset(q, 0, sizeof(q));
+    memset(k, 0, sizeof(k));
+    memset(v, 0, sizeof(v));
     for (int pp = 0; pp < n; ++pp) {
 
         int index = (p + pp) % 64;
@@ -1584,7 +1592,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
     float (*cao)[64][128] = r->layers[layer].core_attn_out;
     __bf16 (*cao_bf16)[64][128] = r->layers[layer].core_attn_out_bf16;
     for (int h = 0; h < 32; ++h) {
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < n; ++i) {
             for (int j = 0; j < 128; ++j) {
                 cao_bf16[h][i][j] = (__bf16)cao[h][i][j];
             }
@@ -1592,8 +1600,8 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
     }
 
     __bf16 (*z)[32][128] = r->layers[layer].z;
-    for (int i = 0; i < 64; ++i) {
-        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)(*qkvz)[i];
+    for (int i = 0; i < n; ++i) {
+        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)qkvz[i];
         for (int h = 0; h < 16; ++h) {
             memcpy(z[i][h * 2], p_qkvz->head[h].z, 256 * sizeof(__bf16));
         }
@@ -1621,6 +1629,8 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         matmul(xout[i], post_lan[i], m->layers[layer].linear_attn_out_proj_w, 4096, 2048);
     }
 }
+
+#pragma GCC pop_options
 
 void *aligned_malloc(size_t alignment, size_t size) {
 
@@ -1665,8 +1675,8 @@ void runtime_init(struct Transformer *xfmr) {
     r->h2 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 256);
     r->h3 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 256);
 
-    r->qkvz = (__bf16 *)aligned_malloc(64, 64 * sizeof(__bf16) * 12288);
-    r->ba = (__bf16 *)aligned_malloc(64, 64 * sizeof(__bf16) * 64);
+    // r->qkvz = (__bf16 *)aligned_malloc(64, 64 * sizeof(__bf16) * 12288);
+    // r->ba = (__bf16 *)aligned_malloc(64, 64 * sizeof(__bf16) * 64);
 
     r->layers = (struct RLayer *)calloc(sizeof(struct RLayer), c->n_layers);
 
