@@ -1024,6 +1024,7 @@ void recurrent_gated_delta_rule(float q[32][128], float k[32][128], float v[32][
     }
 
     static float kv_mem[32][128] = {};
+    memset(kv_mem, 0, sizeof(kv_mem));
     for (int h = 0; h < 32; ++h) {
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
@@ -1168,19 +1169,19 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
     }
 
     float beta[64][32] = {};
-    for (int k = 0; k < 64; ++k) {
-        for (int i = 0; i < 16; ++i) {
+    for (int k = 0; k < n; ++k) {
+        for (int h = 0; h < 16; ++h) {
             for (int j = 0; j < 2; ++j) {
-                beta[k][i * 2 + j] = sigmoid(ba[k][i][0 + j]);
+                beta[k][h * 2 + j] = sigmoid(ba[(p + k) % 64][h][0 + j]);
             }
         }
     }
 
     float a[64][32] = {};
-    for (int k = 0; k < 64; ++k) {
-        for (int i = 0; i < 16; ++i) {
+    for (int k = 0; k < n; ++k) {
+        for (int h = 0; h < 16; ++h) {
             for (int j = 0; j < 2; ++j) {
-                a[k][i * 2 + j] = ba[k][i][2 + j];
+                a[k][h * 2 + j] = ba[(p + k) % 64][h][2 + j];
             }
         }
     }
@@ -1601,7 +1602,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
     __bf16 (*z)[32][128] = r->layers[layer].z;
     for (int i = 0; i < n; ++i) {
-        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)qkvz[i];
+        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)qkvz[(p + i) % 64];
         for (int h = 0; h < 16; ++h) {
             memcpy(z[i][h * 2], p_qkvz->head[h].z, 256 * sizeof(__bf16));
         }
