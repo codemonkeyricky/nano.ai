@@ -1013,7 +1013,7 @@ void recurrent_gated_delta_rule(float q[32][128], float k[32][128], float v[32][
         }
     }
 
-    float kv_mem_tmp[32][128][128] = {};
+    static float kv_mem_tmp[32][128][128] = {};
     for (int h = 0; h < 32; ++h) {
         float (*recurrent)[128] = r->layers[layer].last_recurrent_state[h]; /* 128x128 */
         for (int i = 0; i < 128; ++i) {
@@ -1023,7 +1023,7 @@ void recurrent_gated_delta_rule(float q[32][128], float k[32][128], float v[32][
         }
     }
 
-    float kv_mem[32][128] = {};
+    static float kv_mem[32][128] = {};
     for (int h = 0; h < 32; ++h) {
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
