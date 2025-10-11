@@ -117,7 +117,8 @@ struct RLayer {
     Head *value_cache;
 
     /* linear attention */
-    __bf16 mixed_qkv_raw[4][8192];
+    __bf16 mixed_qkv_raw[64][8192];
+    __bf16 mixed_qkv[64][8192];
     struct Projection *query;
     struct AttentionChunk *attn_cache;
     struct ProjectionChunk *k_cache;
@@ -126,27 +127,36 @@ struct RLayer {
     struct ProjectionChunk *k_beta_exp_cache;
     struct ProjectionChunk *v_beta_cache;
     struct ProjectionChunk *k_cumdecay;
-    struct ProjectionChunk *v_prime;
-    struct ProjectionChunk *v_new;
     struct ProjectionChunk *value;
-    struct RecurrentState *last_recurrent_state;
-    struct ProjectionChunk *core_attn_out;
     struct DecayChunk *beta;
     struct DecayChunk *g;
     struct AttentionChunk *decay_mask;
+    float v_prime[32][64][128];
+    float v_new[32][64][128];
+    float v_new_transposed[32][128][64];
+    float last_recurrent_state[32][128][128];
+    float last_recurrent_state_transposed[32][128][128];
+    float attn_inter[32][64][128];
+    float g_exp[32][64];
+    float g_tmp[32][64];
+    float core_attn_out[32][64][128];
+    __bf16 core_attn_out_bf16[32][64][128];
+    __bf16 z[64][32][128];
+
+    float q[16][1024][256];
+    float k[2][1024][256];
+    float v[2][1024][256];
+    float attn[16][1024][1024];
 };
 
 struct Runtime {
     __bf16 *qg;
     __bf16 *gate;
-    __bf16 *q;
-    __bf16 *k;
-    __bf16 *v;
     __bf16 *h1;
     __bf16 *h2;
     __bf16 *h3;
-    __bf16 *qkvz[4]; /* kernel_size */
-    __bf16 *ba;
+    __bf16 qkvz[64][12288]; //
+    __bf16 ba[64][64];
     float (*g)[32]; // (*g)[64];
 
     struct RLayer *layers;
@@ -240,6 +250,8 @@ void mmap_layer_expert(struct Transformer *x, int layer, int expert) {
         int file_size = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
         *lookup[i].mmap = (const __bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        assert(*lookup[i].mmap != MAP_FAILED);
+        mlock(*lookup[i].mmap, file_size);
         close(fd);
     }
 }
@@ -270,6 +282,8 @@ void mmap_layer_shared_expert(struct Transformer *x, int layer) {
         int file_size = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
         *lookup[i].mmap = (const __bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        assert(*lookup[i].mmap != MAP_FAILED);
+        mlock(*lookup[i].mmap, file_size);
         close(fd);
     }
 }
@@ -310,10 +324,11 @@ void mmap_layer(struct Transformer *x, int layer) {
 
         int fd = open(path, O_RDONLY);
         if (fd > -1) {
-            /* self and linear attention are mutually exclusive */
             int file_size = lseek(fd, 0, SEEK_END);
             lseek(fd, 0, SEEK_SET);
             *lookup[i].mmap = (const __bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            assert(*lookup[i].mmap != MAP_FAILED);
+            mlock(*lookup[i].mmap, file_size);
             close(fd);
         }
     }
@@ -325,6 +340,8 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
     int file_size = lseek(fd, 0, SEEK_END);
     lseek(fd, 0, SEEK_SET);
     mmapping->embeddings = (__bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    assert(mmapping->embeddings != MAP_FAILED);
+    mlock(mmapping->embeddings, file_size);
     close(fd);
 
     mmapping->layers = (struct Layer *)calloc(1, sizeof(struct Layer) * config->n_layers);
@@ -346,6 +363,8 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
     file_size = lseek(fd, 0, SEEK_END);
     lseek(fd, 0, SEEK_SET);
     mmapping->final_layernorm = (__bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    assert(mmapping->final_layernorm != MAP_FAILED);
+    mlock(mmapping->final_layernorm, file_size);
     close(fd);
 
     fd = open("weights/lm_head.bin", O_RDONLY);
@@ -353,6 +372,8 @@ void mmap_init(struct Config *config, struct Mmapping *mmapping) {
         file_size = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
         mmapping->lm_head = (__bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        assert(mmapping->lm_head != MAP_FAILED);
+        mlock(mmapping->lm_head, file_size);
         close(fd);
     }
 }
@@ -430,7 +451,7 @@ void l2norm_forward(__bf16 *out, __bf16 *in, int dim) {
     }
 
     // Calculate reciprocal square root of (sum_squares + eps)
-    __bf16 rsqrt_val = 1.0f / sqrtf(sum_squares + eps);
+    __bf16 rsqrt_val = 1.0f / sqrtf(sum_squares + (__bf16)eps);
     for (int i = 0; i < dim; i++) {
         out[i] = in[i] * rsqrt_val;
     }
@@ -546,7 +567,7 @@ void layernorm(__bf16 *out, const __bf16 *in, const __bf16 *weight, struct Trans
 
 float dot_f32(float *__restrict x, float *__restrict w, int n) {
 
-    assert(n % 32 == 0);
+    // assert(n % 32 == 0);
 
     // x = __builtin_assume_aligned(x, 64);
     // w = __builtin_assume_aligned(w, 64);
@@ -606,7 +627,7 @@ void matmul_bias_f32(float *__restrict out, const float *__restrict x, const flo
     // out = __builtin_assume_aligned(out, 64);
     // x = __builtin_assume_aligned(x, 64);
     // w = __builtin_assume_aligned(w, 64);
-    assert(n % 32 == 0);
+    // assert(n % 32 == 0);
     // assert(d % 32 == 0);
     int i;
     // #pragma omp parallel for private(i)
@@ -634,38 +655,35 @@ void rotate_half(__bf16 *out, const __bf16 *x, int D) {
     }
 }
 
-void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin, const struct Transformer *x, int heads) {
+void rotary_positional_embedding(__bf16 *emb, __bf16 *cos, __bf16 *sin) {
+    int n = 64;
 
-    __bf16 *in = emb; //  *out = x->runtime.h1, *out2 = x->runtime.h2, *out3 = x->runtime.h3;
-    __bf16 out[256], out2[256], out3[256];
-    __bf16 cos_padded[256], sin_padded[256];
-    for (int i = 0; i < 4; ++i) {
-        memcpy(&cos_padded[i * 64], cos, 64 * sizeof(__bf16));
-        memcpy(&sin_padded[i * 64], sin, 64 * sizeof(__bf16));
+    __bf16 first[64], second[64];
+    memcpy(first, emb, 64 * sizeof(__bf16));
+    memcpy(second, emb, 64 * sizeof(__bf16));
+
+    for (int i = 0; i < 64; ++i) {
+        first[i] *= cos[i];
     }
 
-    int n = x->config.head_dim;
+    rotate_half(second, second, 64);
+    for (int i = 0; i < 64; ++i) {
+        second[i] *= sin[i];
+    }
 
-    /* Apply rotary positional embedding for all heads */
-    for (int h = 0; h < heads; h++) {
-        in = emb + h * n;
-
-        /* a = rotate_half(q) * sin */
-        rotate_half(out, in, n);
-        mul(out2, out, sin_padded, n);
-
-        /* b = q * cos */
-        mul(out, in, cos_padded, n);
-
-        /* a + b */
-        add(out3, out, out2, n);
-
-        memcpy(emb + h * n, out3, n * sizeof(__bf16));
+    for (int i = 0; i < 64; ++i) {
+        emb[i] = first[i] + second[i];
     }
 }
 
-void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
-                    const int pos, __bf16 *sin, __bf16 *cos) {
+__bf16 qg_proj[64][8192];
+__bf16 gate[64][4096];
+__bf16 query_state[16][64][256];
+__bf16 key_state[2][64][256];
+__bf16 value_state[2][64][256];
+
+void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
+                    const int p, const int n, __bf16 sin[64][64], __bf16 cos[64][64]) {
     struct query_gate {
         __bf16 q[256];
         __bf16 gate[256];
@@ -675,7 +693,7 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
         __bf16 block[256];
     };
 
-    struct Config *p = &xfmr->config;
+    struct Config *c = &xfmr->config;
     const struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
 
@@ -691,102 +709,190 @@ void self_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct 
     // int sz = p->kv_heads * p->head_dim;
 
     /* query gate projection */
-    matmul(r->qg, x, qw, 2048, 8192);
+    for (int i = 0; i < n; ++i) {
+        matmul(qg_proj[i], x[i], qw, 2048, 8192);
+    }
 
-    /* separate query and gate */
-    struct query_gate *qg = (struct query_gate *)r->qg;
-    for (int i = 0; i < 16; ++i) {
-        memcpy(r->q + i * 256, qg[i].q, 256 * sizeof(__bf16));
-        memcpy(r->gate + i * 256, qg[i].gate, 256 * sizeof(__bf16));
+    for (int i = 0; i < n; ++i) {
+        for (int h = 0; h < 16; ++h) {
+            memcpy(query_state[h][i], &qg_proj[i][512 * h], 256 * sizeof(__bf16));
+            memcpy(&gate[i][h * 256], &qg_proj[i][512 * h + 256], 256 * sizeof(__bf16));
+        }
     }
 
     /* query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2) */
-    struct projection *query_state = (struct projection *)r->q;
     for (int h = 0; h < 16; ++h) {
-        layernorm_n(query_state[h].block, query_state[h].block, m->layers[layer].q_norm, 256, xfmr);
+        for (int i = 0; i < n; ++i) {
+            layernorm_n(query_state[h][i], query_state[h][i], m->layers[layer].q_norm, 256, xfmr);
+        }
     }
 
     /* key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2) */
-    matmul(r->k, x, kw, 2048, 512);
-    struct projection *key_states = (struct projection *)r->k;
-    for (int h = 0; h < 2; ++h) {
-        layernorm_n(key_states[h].block, key_states[h].block, m->layers[layer].k_norm, 256, xfmr);
+    {
+        /* projection */
+        for (int i = 0; i < n; ++i) {
+            __bf16 tmp[2][256] = {};
+            matmul((__bf16 *)tmp, x[i], kw, 2048, 512);
+            for (int h = 0; h < 2; ++h) {
+                memcpy(key_state[h][i], tmp[h], 256 * sizeof(__bf16));
+            }
+        }
+
+        /* normalization */
+        for (int h = 0; h < 2; ++h) {
+            for (int i = 0; i < n; ++i) {
+                layernorm_n(key_state[h][i], key_state[h][i], m->layers[layer].k_norm, 256, xfmr);
+            }
+        }
     }
 
     /* value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) */
-    matmul(r->v, x, vw, 2048, 512);
-
-    rotary_positional_embedding(r->q, cos, sin, xfmr, 16);
-    rotary_positional_embedding(r->k, cos, sin, xfmr, 2);
-
-    volatile int dummy = 0;
-
-    /* insert to kv cache */
-    int attn_sz = p->n_heads * p->head_dim;
-    int sz = p->kv_heads * p->head_dim;
-
-    int n_heads = p->n_heads, kv_heads = p->kv_heads;
-    int hs = attn_sz / p->n_heads;
-    int index = n_heads / kv_heads;
-    for (size_t h = 0; h < kv_heads; h++) {
-        memcpy(r->layers[layer].key_cache[h].cache + pos * hs, r->k + h * hs, hs * sizeof(__bf16));
-        /* value is transposed to simply dot product with query */
-        for (size_t k = 0; k < hs; ++k) {
-            *(r->layers[layer].value_cache[h].cache + p->max_position_embeddings * k + pos) = r->v[h * hs + k];
+    {
+        /* projection */
+        for (int i = 0; i < n; ++i) {
+            __bf16 tmp[2][256] = {};
+            matmul((__bf16 *)tmp, x[i], vw, 2048, 512);
+            for (int h = 0; h < 2; ++h) {
+                memcpy(value_state[h][i], tmp[h], 256 * sizeof(__bf16));
+            }
         }
     }
 
-    /* Calculate attention score */
-    __bf16 att[(pos + 1 + 31) / 32 * 32] = {};
-    __bf16 *y = xout;
-    memset(y, 0, attn_sz * sizeof(__bf16)); // clear output buffer
+    for (int h = 0; h < 16; ++h) {
+        for (int i = 0; i < n; ++i) {
+            rotary_positional_embedding(query_state[h][i], cos[i], sin[i]);
+        }
+    }
 
-    for (int h = 0; h < p->n_heads; h++) {
+    for (int h = 0; h < 2; ++h) {
+        for (int i = 0; i < n; ++i) {
+            rotary_positional_embedding(key_state[h][i], cos[i], sin[i]);
+        }
+    }
 
-        /* current token query at head h */
-        const __bf16 *qq = r->q + h * hs; // (1, hs)
-        for (int t = 0; t <= pos; t++) {
-            /* send query to all previous keys including current */
-            __bf16 *kk = r->layers[layer].key_cache[h / index].cache + t * hs; // (T, hs)
-            att[t] = dot(qq, kk, hs);
+    // __bf16 query_state[16][64][256];
+    // __bf16 key_state[2][64][256];
+    // __bf16 value_state[2][64][256];
+
+    static float y[16][64][256];
+    {
+        float (*q)[1024][256] = r->layers[layer].q;
+        float (*k)[1024][256] = r->layers[layer].k;
+        float (*v)[1024][256] = r->layers[layer].v;
+
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < 256; ++j) {
+                    q[h][p + i][j] = (float)query_state[h][i][j];
+                }
+            }
         }
 
-        /* normalize */
-        for (int t = 0; t <= pos; t++) {
-            att[t] = att[t] / sqrtf(hs) * 0.0625f;
+        for (int h = 0; h < 2; ++h) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < 256; ++j) {
+                    k[h][p + i][j] = (float)key_state[h][i][j];
+                    v[h][p + i][j] = (float)value_state[h][i][j];
+                }
+            }
+        }
+
+        /* process up to 64 at a time */
+        float (*attn)[1024][1024] = r->layers[layer].attn;
+
+        /* att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) */
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                /* 1x256 @ (p+1)x256 */
+                matmul_f32(attn[h][p + i], q[h][p + i], (float *)k[h / 8], 256, p + i + 1);
+            }
+        }
+
+        /* scale */
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < p + i + 1; ++j) {
+                    attn[h][p + i][j] *= 0.0625f;
+                }
+            }
         }
 
         /* soft max */
-        float max_att = att[0];
-        for (int t = 1; t <= pos; t++) {
-            if (att[t] > max_att)
-                max_att = att[t];
-        }
-        float sum_exp = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            att[t] = expf(att[t] - max_att);
-            sum_exp += att[t];
-        }
-        for (int t = 0; t <= pos; t++) {
-            att[t] /= sum_exp;
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                float max_att = attn[h][p + i][0];
+                for (int j = 0; j <= p + i; j++) {
+                    if (attn[h][p + i][j] > max_att)
+                        max_att = attn[h][p + i][j];
+                }
+                float sum_exp = 0.0f;
+                for (int j = 0; j <= p + i; j++) {
+                    attn[h][p + i][j] = expf(attn[h][p + i][j] - max_att);
+                    sum_exp += attn[h][p + i][j];
+                }
+                for (int j = 0; j <= p + i; j++) {
+                    attn[h][p + i][j] /= sum_exp;
+                }
+            }
         }
 
-        /* y = att @ v // (1, T) x (T, hs) -> (1, hs) */
-        for (int i = 0; i < hs; i++) {
-            __bf16 *vv = r->layers[layer].value_cache[h / index].cache;
-            __bf16 *yy = y + h * hs; // (1, hs)
-            /* find v for the current head */
-            yy[i] += dot(att, &vv[i * p->max_position_embeddings], (pos + 1 + 31) / 32 * 32);
+        /* attention is 16x64x64, v is 2x64x256 */
+        static float vt_storage[2][256][1024];
+        float (*vt)[256][p + n] = (__typeof__(vt))vt_storage;
+
+        for (int h = 0; h < 2; ++h) {
+            /* (*v)[1024][256] */
+            transpose((float *)vt[h], (float *)v[h], p + n, 256);
+        }
+
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < n; ++i) {
+                matmul_f32((float *)y[h][i], attn[h][p + i], (float *)vt[h / 8], p + n, 256);
+            }
         }
     }
 
+    static __bf16 tmp[64][16][256];
+    memset(tmp, 0, sizeof(tmp));
+
+    /* convert and transpose */
+    for (int h = 0; h < 16; ++h) {
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < 256; ++j) {
+                tmp[i][h][j] = (__bf16)y[h][i][j];
+            }
+        }
+    }
+
+    /*
+    # manual implementation of attention
+    from torch.nn import functional as F
+    q = query
+    k = key
+    v = value
+    k_expanded = k.repeat_interleave(8, dim=1)
+    att = (q @ k_expanded.transpose(-2, -1)) * 0.0625
+    # TODO mask out upper triangle
+    seq_len = q.size(-2)
+    mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+    att = att.masked_fill(mask, float('-inf'))
+    att = F.softmax(att, dim=-1)
+    v_expanded = v.repeat_interleave(8, dim=1)
+    y = att @ v_expanded
+    */
+
+    static __bf16 tmp2[64][4096];
     /* attn_output = attn_output * torch.sigmoid(gate) */
-    for (int i = 0; i < attn_sz; i++) {
-        x[i] = y[i] * sigmoid(r->gate[i]);
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < 4096; j++) {
+            tmp2[i][j] = ((__bf16 *)tmp[i])[j] * sigmoid(gate[i][j]);
+        }
     }
 
     /* attn_output = self.o_proj(attn_output) */
-    matmul(y, x, ow, attn_sz, p->hidden_size);
+    for (int i = 0; i < n; ++i) {
+        matmul(xout[i], tmp2[i], ow, 4096, 2048);
+    }
 }
 
 struct qkvz {
@@ -833,9 +939,6 @@ float softplus(float x) {
     }
     return log1pf(expf(x));
 }
-
-// __bf16 mixed_qkv_raw[4][8192] = {};
-__bf16 mixed_qkv[4][8192] = {};
 
 void rmsnorm_gated(__bf16 *xout, __bf16 *tmp, __bf16 *zz, __bf16 *w, int n_heads, int head_dim) {
     const float variance_epsilon = 1e-6f;
@@ -885,60 +988,53 @@ void rmsnorm_gated(__bf16 *xout, __bf16 *tmp, __bf16 *zz, __bf16 *w, int n_heads
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
+#pragma GCC pop_options
 
-void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const struct Transformer *xfmr) {
+void recurrent_gated_delta_rule(float q[32][128], float k[32][128], float v[32][128], float g[32], float beta[32],
+                                int layer, int pos, int n, const struct Transformer *xfmr) {
     const struct Config *c = &xfmr->config;
     struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
 
-    int chunk = pos / 64;
-    // int chunk = 0; /* TODO: hack */
-    int offset = pos % 64;
-
-    /* r->layers[layer].query */
-    /* float *v_cache = r->layers[layer].v_cache[chunk].attn[h][offset]; */
-    /* float *k_cache = r->layers[layer].k_cache[chunk].attn[h][offset]; */
-    /* g */
-    /* beta */
-
     float g_exp[32] = {};
-    for (int i = 0; i < 32; ++i) {
-        g_exp[i] = expf(g[i]);
+    for (int h = 0; h < 32; ++h) {
+        g_exp[h] = expf(g[h]);
     }
 
     /* last_recurrent_state = last_recurrent_state * g_t */
     for (int h = 0; h < 32; ++h) {
-        float *recurrent = (float *)r->layers[layer].last_recurrent_state->decay[h]; /* 128x128 */
+        float *recurrent = (float *)r->layers[layer].last_recurrent_state[h]; /* 128x128 */
         for (int j = 0; j < 128 * 128; ++j) {
             recurrent[j] *= g_exp[h];
         }
     }
 
-    struct RecurrentState kv_mem_tmp = {};
+    static float kv_mem_tmp[32][128][128] = {};
     for (int h = 0; h < 32; ++h) {
-        float (*recurrent)[128] = r->layers[layer].last_recurrent_state->decay[h]; /* 128x128 */
-        float *k_t = r->layers[layer].k_cache[chunk].attn[h][offset];
+        float (*recurrent)[128] = r->layers[layer].last_recurrent_state[h]; /* 128x128 */
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
-                kv_mem_tmp.decay[h][i][j] = k_t[i] * recurrent[i][j];
+                kv_mem_tmp[h][i][j] = k[h][i] * recurrent[i][j];
             }
         }
     }
 
-    float kv_mem[32][128] = {};
+    static float kv_mem[32][128] = {};
+    memset(kv_mem, 0, sizeof(kv_mem));
     for (int h = 0; h < 32; ++h) {
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
-                kv_mem[h][j] += kv_mem_tmp.decay[h][i][j];
+                kv_mem[h][j] += kv_mem_tmp[h][i][j];
             }
         }
     }
 
-    float delta[32][128] = {};
-    struct ProjectionChunk *v_cache = &r->layers[layer].v_cache[chunk];
+    /* verified? */
+
+    static float delta[32][128] = {};
     for (int h = 0; h < 32; ++h) {
         for (int j = 0; j < 128; ++j) {
-            delta[h][j] = v_cache->attn[h][offset][j] - kv_mem[h][j];
+            delta[h][j] = v[h][j] - kv_mem[h][j];
         }
     }
 
@@ -948,9 +1044,9 @@ void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const
         }
     }
 
-    float tmp[32][128][128] = {};
+    static float tmp[32][128][128] = {};
     for (int h = 0; h < 32; ++h) {
-        float *k_t = r->layers[layer].k_cache[chunk].attn[h][offset];
+        float *k_t = k[h];
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
                 tmp[h][i][j] = k_t[i] * delta[h][j];
@@ -959,7 +1055,7 @@ void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const
     }
 
     for (int h = 0; h < 32; ++h) {
-        float (*recurrent)[128] = r->layers[layer].last_recurrent_state->decay[h]; /* 128x128 */
+        float (*recurrent)[128] = r->layers[layer].last_recurrent_state[h]; /* 128x128 */
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
                 recurrent[i][j] += tmp[h][i][j];
@@ -967,9 +1063,8 @@ void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const
         }
     }
 
-    float (*q)[128] = (float (*)[128])r->layers[layer].query;                                  /* 32x128 */
     float (*recurrent)[128][128] = (float (*)[128][128])r->layers[layer].last_recurrent_state; /* 32x128x128 */
-    float core_tmp[32][128][128] = {};
+    static float core_tmp[32][128][128] = {};
 
     for (int h = 0; h < 32; ++h) {
         for (int i = 0; i < 128; ++i) {
@@ -979,129 +1074,152 @@ void recurrent_gated_delta_rule(float *g, float *beta, int layer, int pos, const
         }
     }
 
-    float (*core)[64][128] = (float (*)[64][128]) & r->layers[layer].core_attn_out[chunk]; /* 32x64x128 */
+    memset(r->layers[layer].core_attn_out, 0, sizeof(r->layers[layer].core_attn_out));
+    float (*core)[64][128] = (float (*)[64][128])r->layers[layer].core_attn_out; /* 32x64x128 */
     for (int h = 0; h < 32; ++h) {
         for (int i = 0; i < 128; ++i) {
             for (int j = 0; j < 128; ++j) {
-                core[h][offset][j] += core_tmp[h][i][j];
+                core[h][0][j] += core_tmp[h][i][j];
             }
         }
     }
-
-    volatile int dummy = 0;
 }
 
-#pragma GCC pop_options
-
-void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struct Transformer *xfmr, const int layer,
-                      const int pos, __bf16 *sin, __bf16 *cos, int prefill) {
+void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
+                      const int p, const int n, __bf16 sin[64][64], __bf16 cos[64][64], int prefill) {
     const struct Config *c = &xfmr->config;
     struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
-    int pp = pos % 4;
+
+    if (p == 64) {
+        volatile int dummy = 0;
+    }
+
+    __bf16 (*qkvz)[12288] = (__bf16 (*)[12288])r->qkvz;
+    __bf16 (*ba)[16][4] = (__bf16 (*)[16][4])r->ba;
 
     /* qkvz and ba projection */
-    matmul(r->qkvz[pp], x, m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
-    matmul(r->ba, x, m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
+    for (int i = 0; i < n; ++i) {
+        matmul(qkvz[(p + i) % 64], x[i], m->layers[layer].linear_attn_in_proj_qkvz_w, c->hidden_size, 12288);
+    }
 
-    struct projected_qkvz *qkvz = (struct projected_qkvz *)r->qkvz[pp];
-    __bf16 *debug = (__bf16 *)qkvz;
+    /* ba is 64x(16x2x2) */
+    for (int i = 0; i < n; ++i) {
+        matmul((__bf16 *)ba[(p + i) % 64], x[i], m->layers[layer].linear_attn_in_proj_ba_w, c->hidden_size, 64);
+    }
 
     /* Convert from interleaved to concatenated format */
 
-    __bf16 (*mixed_qkv_raw)[8192] = r->layers[layer].mixed_qkv_raw;
+    __bf16 (*raw)[8192] = r->layers[layer].mixed_qkv_raw;
 
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 128; j++) {
-            mixed_qkv_raw[pp][0 + i * 128 + j] = qkvz->head[i].q[j];
+    for (int kk = p; kk < p + n; ++kk) {
+
+        int k = kk % 64;
+
+        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)qkvz[k];
+
+        for (int i = 0; i < 16; i++) {
+            for (int j = 0; j < 128; j++) {
+                raw[k][0 + i * 128 + j] = p_qkvz->head[i].q[j];
+            }
         }
-    }
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 128; j++) {
-            mixed_qkv_raw[pp][2048 + i * 128 + j] = qkvz->head[i].k[j];
+        for (int i = 0; i < 16; i++) {
+            for (int j = 0; j < 128; j++) {
+                raw[k][2048 + i * 128 + j] = p_qkvz->head[i].k[j];
+            }
         }
-    }
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 256; j++) {
-            mixed_qkv_raw[pp][4096 + i * 256 + j] = qkvz->head[i].v[j];
+        for (int i = 0; i < 16; i++) {
+            for (int j = 0; j < 256; j++) {
+                raw[k][4096 + i * 256 + j] = p_qkvz->head[i].v[j];
+            }
         }
     }
 
     /* TODO: save most recent 4 mixed_qkv[pp] for next iterations */
 
+    __bf16 (*mixed)[8192] = r->layers[layer].mixed_qkv;
+
     /* conv1d over qkv - 8192 dimensions */
     struct conv1d_w *w = (struct conv1d_w *)m->layers[layer].linear_attn_conv1d_w;
-    for (int i = 0; i < 8192; i++) {
-        __bf16 tmp = 0;
-        for (int k = 0; k < 4; ++k) {
-            __bf16 c1 = mixed_qkv_raw[(pp + 1 + k) % 4][i];
-            __bf16 c2 = w[i].w[k];
-            tmp += c1 * c2;
-        }
-        mixed_qkv[pp][i] = tmp;
-    }
-
-    /* silu on all 8192 elements */
-    silu_array(mixed_qkv[pp], mixed_qkv[pp], 8192);
-
-    struct projected_ba *ba = (struct projected_ba *)r->ba;
-    __bf16 beta_bf16[32] = {};
-    for (int i = 0; i < 16; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            beta_bf16[i * 2 + j] = sigmoid(ba->ba[i].b[j]);
+    for (int pp = p; pp < p + n; ++pp) {
+        for (int i = 0; i < 8192; i++) {
+            __bf16 tmp = 0;
+            for (int k = 0; k < 4; ++k) {
+                __bf16 c1 = raw[(64 - 3 + pp + k) % 64][i]; /* use the zero padding at the end */
+                __bf16 c2 = w[i].w[k];
+                tmp += c1 * c2;
+            }
+            mixed[pp % 64][i] = tmp;
         }
     }
 
-    float a[32] = {};
-    for (int i = 0; i < 16; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            a[i * 2 + j] = ba->ba[i].a[j];
+    for (int pp = p; pp < p + n; ++pp) {
+
+        int ppp = pp % 64;
+
+        /* silu on all 8192 elements */
+        silu_array(mixed[ppp], mixed[ppp], 8192);
+    }
+
+    float beta[64][32] = {};
+    for (int k = 0; k < n; ++k) {
+        for (int h = 0; h < 16; ++h) {
+            for (int j = 0; j < 2; ++j) {
+                beta[k][h * 2 + j] = sigmoid(ba[(p + k) % 64][h][0 + j]);
+            }
         }
     }
 
-    for (int i = 0; i < 32; ++i) {
-        a[i] = a[i] + (float)m->layers[layer].linear_attn_dt_b[i];
-    }
-
-    for (int i = 0; i < 32; ++i) {
-        a[i] = softplus(a[i]);
-    }
-
-    float nalogexp[32] = {};
-    for (int i = 0; i < 32; ++i) {
-        nalogexp[i] = -expf((float)m->layers[layer].linear_attn_a_log[i]);
-    }
-
-    float g[32] = {};
-    for (int i = 0; i < 32; ++i) {
-        g[i] = nalogexp[i] * a[i];
-    }
-
-    float beta[32] = {};
-    for (int i = 0; i < 32; ++i) {
-        beta[i] = beta_bf16[i];
-    }
-
-    /* v shaped as 32 heads x 128 dim */
-    for (int i = 0; i < 32; i++) {
-        for (int j = 0; j < 128; j++) {
-            qkvz->head[i / 2].v[(i % 2 * 128) + j] *= beta[i];
+    float a[64][32] = {};
+    for (int k = 0; k < n; ++k) {
+        for (int h = 0; h < 16; ++h) {
+            for (int j = 0; j < 2; ++j) {
+                a[k][h * 2 + j] = ba[(p + k) % 64][h][2 + j];
+            }
         }
     }
 
-    __bf16 *query, *key, *value;
-    query = mixed_qkv[pp] + 0;
-    key = mixed_qkv[pp] + 2048;
-    value = mixed_qkv[pp] + 4096;
-
-    /* query is normalized and scaled */
-    for (int i = 0; i < 2048; i += 128) {
-        l2norm_forward(query + i, query + i, 128);
+    for (int k = 0; k < 64; ++k) {
+        for (int i = 0; i < 32; ++i) {
+            a[k][i] = a[k][i] + (float)m->layers[layer].linear_attn_dt_b[i];
+        }
+        for (int i = 0; i < 32; ++i) {
+            a[k][i] = softplus(a[k][i]);
+        }
     }
 
-    /* key is normalized not scaled */
-    for (int i = 0; i < 2048; i += 128) {
-        l2norm_forward(key + i, key + i, 128);
+    float nalogexp[64][32] = {};
+    for (int k = 0; k < 64; ++k) {
+        for (int i = 0; i < 32; ++i) {
+            nalogexp[k][i] = -expf((float)m->layers[layer].linear_attn_a_log[i]);
+        }
+    }
+
+    float g[32][64] = {};
+    for (int h = 0; h < 32; ++h) {
+        for (int k = 0; k < n; ++k) {
+            g[h][k] = nalogexp[k][h] * a[k][h];
+        }
+    }
+
+    for (int kk = p; kk < p + n; ++kk) {
+
+        int k = kk % 64;
+
+        __bf16 *query, *key, *value;
+        query = mixed[k] + 0;
+        key = mixed[k] + 2048;
+        value = mixed[k] + 4096;
+
+        /* query is normalized and scaled */
+        for (int i = 0; i < 2048; i += 128) {
+            l2norm_forward(query + i, query + i, 128);
+        }
+
+        /* key is normalized not scaled */
+        for (int i = 0; i < 2048; i += 128) {
+            l2norm_forward(key + i, key + i, 128);
+        }
     }
 
     /*
@@ -1109,82 +1227,55 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
      * Convert qkv floats
      */
 
-    float q[4096] = {}, k[4096] = {}, v[4096] = {};
-    for (int i = 0; i < 4096; ++i) {
-        v[i] = value[i];
-    }
+    static float q[64][4096] = {};
+    static float k[64][4096] = {};
+    static float v[64][4096] = {};
+    memset(q, 0, sizeof(q));
+    memset(k, 0, sizeof(k));
+    memset(v, 0, sizeof(v));
+    for (int pp = 0; pp < n; ++pp) {
 
-    float scale = 1.0f / sqrtf(128);
-    for (int h = 0; h < 16; ++h) {
-        for (int i = 0; i < 128; ++i) {
-            int k1 = (h * 2 + 0) * 128 + i;
-            int k2 = (h * 2 + 1) * 128 + i;
-            k[k1] = k[k2] = key[h * 128 + i];
-            /* scale query */
-            q[k1] = q[k2] = scale * (float)query[h * 128 + i];
+        int index = (p + pp) % 64;
+
+        __bf16 *query, *key, *value;
+        query = mixed[index] + 0;
+        key = mixed[index] + 2048;
+        value = mixed[index] + 4096;
+
+        for (int i = 0; i < 4096; ++i) {
+            v[pp][i] = value[i];
+        }
+
+        float scale = 1.0f / sqrtf(128);
+        for (int h = 0; h < 16; ++h) {
+            for (int i = 0; i < 128; ++i) {
+                int k1 = (h * 2 + 0) * 128 + i;
+                int k2 = (h * 2 + 1) * 128 + i;
+                k[pp][k1] = k[pp][k2] = key[h * 128 + i];
+                q[pp][k1] = q[pp][k2] = scale * (float)query[h * 128 + i]; /* scale query */
+            }
         }
     }
 
-    int chunk = pos / 64;
-    int offset = pos % 64;
-
-    for (int h = 0; h < 32; ++h) {
-        struct Projection *qq = r->layers[layer].query;
-        memcpy((float *)qq->attn[h], q + h * 128, sizeof(float) * 128);
-        volatile int dummy = 0;
-    }
-
-    /* insert into key cache, head by head */
-    for (int h = 0; h < 32; ++h) {
-        float *k_cache = r->layers[layer].k_cache[chunk].attn[h][offset];
-        float *key = k + h * 128;
-        memcpy(k_cache, key, sizeof(float) * 128);
-    }
-
-    for (int h = 0; h < 32; ++h) {
-        float *v_cache = r->layers[layer].v_cache[chunk].attn[h][offset];
-        float *value = v + h * 128;
-        memcpy(v_cache, value, sizeof(float) * 128);
-    }
-
-    /*
-     * ==========================================================
-     */
-
-    /*
-     * v_beta = value * beta.unsqueeze(-1)
-     * k_beta = key * beta.unsqueeze(-1)
-     *
-     * k_beta and v_beta are both 32 x 128
-     */
-
-    for (int h = 0; h < 32; ++h) {
-        float *v = r->layers[layer].v_cache[chunk].attn[h][offset];
-        float *k = r->layers[layer].k_cache[chunk].attn[h][offset];
-        float *vb = r->layers[layer].v_beta_cache[chunk].attn[h][offset];
-        float *kb = r->layers[layer].k_beta_cache[chunk].attn[h][offset];
-        for (int j = 0; j < 128; ++j) {
-            vb[j] = v[j] * beta[h];
-            kb[j] = k[j] * beta[h];
+    float v_beta[64][32][128] = {};
+    float k_beta[64][32][128] = {};
+    for (int p = 0; p < n; ++p) {
+        for (int h = 0; h < 32; ++h) {
+            for (int j = 0; j < 128; ++j) {
+                v_beta[p][h][j] = v[p][h * 128 + j] * beta[p][h];
+                k_beta[p][h][j] = k[p][h * 128 + j] * beta[p][h];
+            }
         }
     }
-
-    struct ProjectionChunk *v_beta = r->layers[layer].v_beta_cache;
-    struct ProjectionChunk *k_beta = r->layers[layer].k_beta_cache;
 
     /*
      * g = g.cumsum(dim=-1)
      * g is cumulative sum of decay factors
      */
+    /* float g[32][64] = {}; */
     for (int h = 0; h < 32; ++h) {
-        r->layers[layer].g->decay[h][pos] = g[h];
-        if (pos) {
-            r->layers[layer].g->decay[h][pos] += r->layers[layer].g->decay[h][pos - 1];
-        }
-
-        /* fill in the rest with the last value */
-        for (int j = pos + 1; j < 64; ++j) {
-            r->layers[layer].g->decay[h][j] = r->layers[layer].g->decay[h][pos];
+        for (int i = 1; i < 64; ++i) {
+            g[h][i] += g[h][i - 1];
         }
     }
 
@@ -1193,20 +1284,13 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
 
         /*
          * decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-         *
-         * The transforrmers code generates decay for all pairs of indices, then
-         * apply a trianglar mask to remove the invalid ones (eg. current only
-         * decays into the past). The python code creates the matrix for all
-         * tokens, for decoding we only need one row.
-         *
-         * While g can be re-used, decay_mask needs to be re-calculated as current
-         * moves forward.
          */
+        float decay_mask[32][64][64] = {};
         for (int h = 0; h < 32; ++h) {
-            float *decay_mask = r->layers[layer].decay_mask[chunk].attn[h][pos];
-            float (*g)[64] = r->layers[layer].g->decay;
-            for (int i = 0; i <= pos; ++i) {
-                decay_mask[i] = expf(g[h][pos] - g[h][i]);
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j <= i; ++j) {
+                    decay_mask[h][i][j] = expf(g[h][i] - g[h][j]);
+                }
             }
         }
 
@@ -1222,246 +1306,322 @@ void linear_attention(__bf16 *__restrict xout, __bf16 *__restrict x, const struc
          *  TODO: implement the above more efficient recurrent calculation
          */
 
+        /* tranpose head and seq_len */
+        static float qq[32][64][128] = {};
+        static float kk[32][64][128] = {};
+        static float vv[32][64][128] = {};
+        for (int i = 0; i < 64; ++i) {
+            for (int h = 0; h < 32; ++h) {
+                for (int j = 0; j < 128; ++j) {
+                    qq[h][i][j] = q[i][h * 128 + j];
+                    kk[h][i][j] = k[i][h * 128 + j];
+                    vv[h][i][j] = v[i][h * 128 + j];
+                }
+            }
+        }
+
+        static float kk_beta[32][64][128] = {};
         for (int h = 0; h < 32; ++h) {
-            float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h][offset];
-            float *k_beta = (float *)r->layers[layer].k_beta_cache[chunk].attn[h][offset];
-            float *k_cache = (float *)r->layers[layer].k_cache[chunk].attn[h];
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 128; ++j) {
+                    kk_beta[h][i][j] = kk[h][i][j] * beta[i][h];
+                }
+            }
+        }
+
+        static float vv_beta[32][64][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 128; ++j) {
+                    vv_beta[h][i][j] = vv[h][i][j] * beta[i][h];
+                }
+            }
+        }
+
+        float attn[32][64][64] = {};
+
+        for (int h = 0; h < 32; ++h) {
 
             /*
              * k_beta attending to all keys
              * deliberately stop before offset because upper right is masked out
              */
-            matmul_f32(attn, k_beta, k_cache, 128, offset);
-
-            /* apply decay mask */
-            for (int i = 0; i < offset; ++i) {
-                attn[i] = -(attn[i] * r->layers[layer].decay_mask[chunk].attn[h][pos][i]);
+            for (int i = 0; i < 64; ++i) {
+                matmul_f32(attn[h][i], kk_beta[h][i], (float *)kk[h], 128, 64);
             }
 
-            float (*attn2)[64] = r->layers[layer].attn_cache[chunk].attn[h];
-            float tmp[offset][offset];
-            memset(tmp, 0, sizeof(tmp));
-            for (int i = 0; i < offset; ++i) {
-                /* upper right is cleared */
-                for (int j = 0; j < i; ++j) {
-                    tmp[i][j] = attn2[i][j];
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 64; ++j) {
+                    attn[h][i][j] = -(attn[h][i][j] * decay_mask[h][i][j]);
                 }
             }
 
-            /* row.unsqueeze(-1) * sub */
-            for (int i = 0; i < offset; ++i) {
-                for (int j = 0; j < offset - 1; ++j) {
-                    tmp[i][j] *= attn2[offset][i];
-                }
+            for (int i = 0; i < 64; ++i) {
+                attn[h][i][i] = 0.0f;
             }
-
-            /* vertical summation */
-            for (int j = 0; j < offset; j++) {
-                float sum = 0.0f;
-                for (int i = 0; i < offset; i++) {
-                    sum += tmp[i][j];
-                }
-                attn2[offset][j] += sum;
-            }
-
-            /* attn = attn + torch.eye */
-            attn[offset] = 1.0f;
         }
 
-        /*
-         * value = attn @ v_beta
-         * 64x128 = 64x64 @ 64x128
-         */
+        for (int i = 1; i < 64; i++) {
+            for (int head = 0; head < 32; head++) {
+                float row[64];
+                for (int j = 0; j < i; j++) {
+                    row[j] = attn[head][i][j];
+                }
+
+                float sub[64][64];
+                for (int k = 0; k < i; k++) {
+                    for (int j = 0; j < i; j++) {
+                        sub[k][j] = attn[head][k][j];
+                    }
+                }
+
+                for (int j = 0; j < i; j++) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < i; k++) {
+                        sum += row[k] * sub[k][j];
+                    }
+                    attn[head][i][j] = row[j] + sum;
+                }
+            }
+        }
+
         for (int h = 0; h < 32; ++h) {
-            float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h][offset];
-            float *v_beta = (float *)r->layers[layer].v_beta_cache[chunk].attn[h];
-            float *value = (float *)r->layers[layer].value[chunk].attn[h][offset];
+            for (int i = 0; i < 64; ++i) {
+                attn[h][i][i] += 1.0f;
+            }
+        }
 
-            /*
-             * attn attending to all v_beta
-             * 1x64 @ 64x128 = 1x128
-             */
-
-            float tmp[128][64] = {};
-            transpose((float *)tmp, v_beta, 64, 128);
-            matmul_f32(value, attn, (float *)tmp, 64, 128);
+        static float value[32][64][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                float tmp[128][64] = {};
+                transpose((float *)tmp, (float *)vv_beta[h], 64, 128);
+                matmul_f32(value[h][i], attn[h][i], (float *)tmp, 64, 128);
+            }
         }
 
         /* k_beta * g.exp() */
-        for (int h = 0; h < 32; ++h) {
-            float g = r->layers[layer].g[chunk].decay[h][pos];
-            float g_exp = expf(g);
-            float *k_beta = (float *)r->layers[layer].k_beta_cache[chunk].attn[h][offset];
-            float *k_beta_exp = (float *)r->layers[layer].k_beta_exp_cache[chunk].attn[h][offset];
-            for (int j = 0; j < 128; ++j) {
-                k_beta_exp[j] = k_beta[j] * g_exp;
-            }
-        }
-
-        /* k_cumdecay = attn @ (k_beta * g.exp()) */
-        for (int h = 0; h < 32; ++h) {
-            float *attn = (float *)r->layers[layer].attn_cache[chunk].attn[h][offset];
-            float *k_beta = (float *)r->layers[layer].k_beta_exp_cache[chunk].attn[h];
-            float *k_cumdecay = (float *)r->layers[layer].k_cumdecay[chunk].attn[h][offset];
-
-            /*
-             * attn is 1x64
-             * (k_beta * g.exp()) is 64x128
-             * k_cumdecay is 1x128
-             */
-
-            float tmp[128][64] = {};
-            transpose((float *)tmp, k_beta, 64, 128);
-            matmul_f32(k_cumdecay, attn, (float *)tmp, 64, 128);
-        }
-
-        // int chunk = pos / 64;
-        // int offset = pos % 64;
-        int chunks = ((pos + 1) + 63) / 64;
-
-        // struct RecurrentState emptyRecurrentState = {};
-        // *r->layers[layer].last_recurrent_state = emptyRecurrentState;
-
-        struct ProjectionChunk project_chunk_zeroes = {};
-        r->layers[layer].core_attn_out[chunk] = project_chunk_zeroes;
-
-        /* attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0) */
-        float attention[32][64] = {}; /* attention for current token only */
-        for (int h = 0; h < 32; ++h) {
-            float *q = r->layers[layer].query->attn[h];                  /* 1x1x128 */
-            float *k = (float *)r->layers[layer].k_cache[chunk].attn[h]; /* 1x64x128 */
-            float *attn = attention[h];                                  /* 1x64 */
-            matmul_f32(attn, q, k, 128, 64);
-            mul_f32(attn, attn, r->layers[layer].decay_mask[chunk].attn[h][offset], 64);
-        }
-
-        /* TODO: v_prime and v_new requires previous tokens because
-         * attention calculation requires them later */
-
-        /* v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state */
-        for (int h = 0; h < 32; ++h) {
-            float *k_cumdecay = (float *)r->layers[layer].k_cumdecay[chunk].attn[h][offset]; /* 1x128 */
-            float *recurrent = (float *)r->layers[layer].last_recurrent_state->decay[h];  /* 128x128 */
-            float *v_prime = (float *)r->layers[layer].v_prime[chunk].attn[h][offset];       /* 1x128 */
-            float tmp[128][128] = {};
-            transpose((float *)tmp, recurrent, 128, 128);
-            matmul_f32(v_prime, k_cumdecay, (float *)tmp, 128, 128);
-        }
-
-        /* v_new = v_i - v_prime */
-        for (int h = 0; h < 32; ++h) {
-            float *v_i = (float *)r->layers[layer].value[chunk].attn[h][offset];
-            float *v_prime = (float *)r->layers[layer].v_prime[chunk].attn[h][offset]; /* 1x128 */
-            float *v_new = (float *)r->layers[layer].v_new[chunk].attn[h][offset];     /* 1x128 */
-            subtract_f32(v_new, v_i, v_prime, 128);
-        }
-
-        /*
-         * attn_inter = (q_i * g[:, :, i, :, None].exp()) @last_recurrent_state
-         *
-         * q_i -> 32x1x128
-         * g.exp -> 32
-         */
-
-        float attn_inter[32][128] = {};
-        for (int h = 0; h < 32; ++h) {
-            float *q = r->layers[layer].query->attn[h]; /* 1x1x128 */
-            float g = r->layers[layer].g->decay[h][pos];
-            for (int j = 0; j < 128; ++j) {
-                attn_inter[h][j] *= expf(g);
-            }
-
-            float tmp[128][128] = {};
-            float *recurrent = (float *)r->layers[layer].last_recurrent_state->decay[h]; /* 128x128 */
-            transpose((float *)tmp, recurrent, 128, 128);
-            matmul_f32(attn_inter[h], attn_inter[h], (float *)tmp, 128, 1);
-        }
-
-        /* core_attn_out[:, :, i] = attn_inter + attn @ v_new */
-        for (int h = 0; h < 32; ++h) {
-            float *attn = attention[h]; /* 1x64 */
-            float v_new_transposed[128][64] = {};
-            float tmp[128] = {};
-            float *v_new = (float *)r->layers[layer].v_new[chunk].attn[h]; /* 64x128 */
-            transpose((float *)v_new_transposed, v_new, 64, 128);
-            matmul_f32(tmp, attn, (float *)v_new_transposed, 64, 128); /* 1x64 @ 64x128 = 1x128*/
-
-            float *core_attn_out = (float *)r->layers[layer].core_attn_out[chunk].attn[h][offset];
-            for (int j = 0; j < 128; ++j) {
-                core_attn_out[j] = attn_inter[h][j] + tmp[j] /* since attn is 1x1 */;
-            }
-        }
-
-        /*
-         * last_recurrent_state = (
-         *   last_recurrent_state * g[:, :, i, -1, None, None].exp()
-         *   + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-         */
-
-        /* (g[:, :, i, -1, None] - g[:, :, i]) */
-        struct DecayChunk g_copy = *r->layers[layer].g;
-        for (int h = 0; h < 32; ++h) {
-            float last = g_copy.decay[h][63];
-            for (int j = 0; j < 64; ++j) {
-                g_copy.decay[h][j] = last - g_copy.decay[h][j];
-            }
-        }
-
-        /* (g[:, :, i, -1, None] - g[:, :, i]).exp() */
-        for (int h = 0; h < 32; ++h) {
-            for (int j = 0; j < 64; ++j) {
-                g_copy.decay[h][j] = expf(g_copy.decay[h][j]);
-            }
-        }
-
-        /* k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp() */
-        struct ProjectionChunk k_i = r->layers[layer].k_cache[chunk]; /* 32x64x128 */
+        /* float g[32][64] = {}; */
+        /* static float kk_beta[32][64][128] = {}; */
+        static float kk_beta_exp[32][64][128] = {};
         for (int h = 0; h < 32; ++h) {
             for (int i = 0; i < 64; ++i) {
                 for (int j = 0; j < 128; ++j) {
-                    k_i.attn[h][i][j] *= g_copy.decay[h][i];
+                    kk_beta_exp[h][i][j] = kk_beta[h][i][j] * expf(g[h][i]);
                 }
             }
         }
 
-        struct RecurrentState *last_recurrent_state = r->layers[layer].last_recurrent_state;
+        static float k_cumdecay[32][64][128] = {};
         for (int h = 0; h < 32; ++h) {
-            float tmp[128][64] = {};
-            transpose((float *)tmp, (float *)k_i.attn[h], 64, 128); /* 128x64 */
-            for (int i = 0; i < 128; ++i) {
-                tmp[i];                                                        /* 1x64 */
-                float *v_new = (float *)r->layers[layer].v_new[chunk].attn[h]; /* 64x128 */
-                float tmp2[128][64] = {};
-                transpose((float *)tmp2, v_new, 64, 128);
-                matmul_f32((float *)last_recurrent_state->decay[h][i], (float *)tmp[i], (float *)tmp2, 64,
-                           128); /* 1x128 */
+            for (int i = 0; i < 64; ++i) {
+                float tmp[128][64] = {};
+                transpose((float *)tmp, (float *)kk_beta_exp[h], 64, 128);
+                matmul_f32(k_cumdecay[h][i], attn[h][i], (float *)tmp, 64, 128);
+            }
+        }
+
+        /*
+         * TODO:
+         * last_current_state is 32x128x128
+         * core_attn_out is 32x64x128
+         * initialized to all zeroes at start.
+         */
+
+        static float attn2[32][64][64] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                matmul_f32(attn2[h][i], qq[h][i], (float *)kk[h], 128, 64);
+            }
+
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 64; ++j) {
+                    attn2[h][i][j] *= decay_mask[h][i][j];
+                }
+            }
+        }
+
+        float (*lrs)[128][128] = r->layers[layer].last_recurrent_state;
+        float (*lrs_t)[128][128] = r->layers[layer].last_recurrent_state_transposed;
+
+        for (int h = 0; h < 32; ++h) {
+            transpose((float *)lrs_t[h], (float *)lrs[h], 128, 128);
+        }
+
+        float (*v_prime)[64][128] = r->layers[layer].v_prime;
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                matmul_f32(v_prime[h][i], k_cumdecay[h][i], (float *)lrs_t[h], 64, 128); /* 1x64 @ 64x128 = 1x128*/
+            }
+        }
+
+        float (*v_new)[64][128] = r->layers[layer].v_new;
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                subtract_f32(v_new[h][i], value[h][i], v_prime[h][i], 128);
+            }
+        }
+
+        float (*g_exp)[64] = r->layers[layer].g_exp;
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                g_exp[h][i] = expf(g[h][i]);
+            }
+        }
+
+        float (*attn_inter)[64][128] = r->layers[layer].attn_inter;
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                for (int j = 0; j < 128; ++j) {
+                    attn_inter[h][i][j] = qq[h][i][j] * g_exp[h][i];
+                }
+            }
+        }
+
+        for (int h = 0; h < 32; ++h) {
+            for (int i = 0; i < 64; ++i) {
+                matmul_f32(attn_inter[h][i], attn_inter[h][i], (float *)lrs_t[h], 128, 128);
+            }
+        }
+
+        /* attn @ v_new */
+        float (*core_attn_out)[64][128] = r->layers[layer].core_attn_out;
+        {
+            float (*v_new_t)[128][64] = r->layers[layer].v_new_transposed;
+            for (int h = 0; h < 32; ++h) {
+                transpose((float *)v_new_t[h], (float *)v_new[h], 64, 128);
+            }
+
+            static float tmp[32][64][128] = {};
+            for (int h = 0; h < 32; ++h) {
+                for (int i = 0; i < 64; ++i) {
+                    matmul_f32(tmp[h][i], attn2[h][i], (float *)v_new_t[h], 64, 128); /* 1x64 @ 64x128 = 1x128*/
+                }
+            }
+
+            for (int h = 0; h < 32; ++h) {
+                for (int i = 0; i < 64; ++i) {
+                    for (int j = 0; j < 128; ++j) {
+                        core_attn_out[h][i][j] = attn_inter[h][i][j] + tmp[h][i][j];
+                    }
+                }
+            }
+        }
+
+        /*
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+            */
+        {
+
+            float (*g_tmp)[64] = r->layers[layer].g_tmp;
+
+            /* (g[:, :, i, -1, None] - g[:, :, i]) */
+            for (int h = 0; h < 32; ++h) {
+                for (int j = 0; j < 64; ++j) {
+                    g_tmp[h][j] = g[h][63] - g[h][j];
+                }
+            }
+
+            for (int h = 0; h < 32; ++h) {
+                for (int j = 0; j < 64; ++j) {
+                    g_tmp[h][j] = expf(g_tmp[h][j]);
+                }
+            }
+
+            /* k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp() */
+            for (int h = 0; h < 32; ++h) {
+                for (int i = 0; i < 64; ++i) {
+                    for (int j = 0; j < 128; ++j) {
+                        kk[h][i][j] *= g_tmp[h][i];
+                    }
+                }
+            }
+
+            /* lrs_tmp = (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new */
+            static float lrs_tmp[32][128][128] = {};
+            for (int h = 0; h < 32; ++h) {
+                static float tmp[128][64] = {};
+                static float v_new_t[128][64] = {};
+                transpose((float *)tmp, (float *)kk[h], 64, 128);
+                transpose((float *)v_new_t, (float *)v_new[h], 64, 128);
+                /* 128x64 @ 64x128 = 128x128 */
+                for (int i = 0; i < 128; ++i) {
+                    matmul_f32((float *)lrs_tmp[h][i], (float *)tmp[i], (float *)v_new_t, 64, 128); /* 1x128 */
+                }
+            }
+
+            /* last_recurrent_state * g[:, :, i, -1, None, None].exp() */
+            for (int h = 0; h < 32; ++h) {
+                for (int i = 0; i < 128; ++i) {
+                    for (int j = 0; j < 128; ++j) {
+                        lrs[h][i][j] *= expf(g[h][63]);
+                    }
+                }
+            }
+
+            for (int h = 0; h < 32; ++h) {
+                for (int i = 0; i < 128; ++i) {
+                    for (int j = 0; j < 128; ++j) {
+                        lrs[h][i][j] += lrs_tmp[h][i][j];
+                    }
+                }
             }
         }
     } else {
         /* recurrent gated delta rule */
-        recurrent_gated_delta_rule(g, beta, layer, pos, xfmr);
+
+        float gg[32];
+        for (int h = 0; h < 32; ++h) {
+            gg[h] = g[h][0];
+        }
+
+        recurrent_gated_delta_rule((float (*)[128])q, (float (*)[128])k, (float (*)[128])v, gg, beta[0], layer, p, 1,
+                                   xfmr);
     }
 
-    /* last_recurrent_state * g[:, :, i, -1, None, None].exp() + ...  */
-
     /* convert back to bf16 */
-    __bf16 tmp[32 * 128] = {};
+    float (*cao)[64][128] = r->layers[layer].core_attn_out;
+    __bf16 (*cao_bf16)[64][128] = r->layers[layer].core_attn_out_bf16;
     for (int h = 0; h < 32; ++h) {
-        float *core = (float *)r->layers[layer].core_attn_out[chunk].attn[h][offset];
-        for (int j = 0; j < 128; ++j) {
-            tmp[h * 128 + j] = (__bf16)core[j];
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < 128; ++j) {
+                cao_bf16[h][i][j] = (__bf16)cao[h][i][j];
+            }
         }
     }
 
-    __bf16 zz[32 * 128] = {};
-    for (int h = 0; h < 16; ++h) {
-        memcpy(&zz[h * 256], qkvz->head[h].z, 256 * sizeof(__bf16));
+    __bf16 (*z)[32][128] = r->layers[layer].z;
+    for (int i = 0; i < n; ++i) {
+        struct projected_qkvz *p_qkvz = (struct projected_qkvz *)qkvz[(p + i) % 64];
+        for (int h = 0; h < 16; ++h) {
+            memcpy(z[i][h * 2], p_qkvz->head[h].z, 256 * sizeof(__bf16));
+        }
     }
 
-    rmsnorm_gated(xout, tmp, zz, m->layers[layer].linear_attn_norm, 32, 128);
-    memcpy(tmp, xout, 32 * 128 * sizeof(__bf16));
+    /* linear attention normalize core_attn_out */
 
-    matmul(xout, tmp, m->layers[layer].linear_attn_out_proj_w, 4096, c->hidden_size);
+    __bf16 post_lan[64][4096]; /* post linear attention norm */
+    for (int i = 0; i < n; ++i) {
+        /* Pull out head and dim per token */
+        __bf16 tmp[32][128] = {};
+        for (int h = 0; h < 32; ++h) {
+            for (int j = 0; j < 128; ++j) {
+                tmp[h][j] = cao_bf16[h][i][j];
+            }
+        }
+
+        /* post_lan[i] = 4096, tmp = 32x128, z[i] = 32x128, */
+        rmsnorm_gated(post_lan[i], (__bf16 *)tmp, (__bf16 *)z[i], m->layers[layer].linear_attn_norm, 32, 128);
+    }
+
+    /* out projection */
+
+    for (int i = 0; i < n; ++i) {
+        matmul(xout[i], post_lan[i], m->layers[layer].linear_attn_out_proj_w, 4096, 2048);
+    }
 }
 
 void *aligned_malloc(size_t alignment, size_t size) {
@@ -1498,19 +1658,17 @@ void runtime_init(struct Transformer *xfmr) {
     int sz = c->head_dim * c->kv_heads;
 
     r->qg = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
-    r->q = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
     r->gate = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
-    r->k = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
-    r->v = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
+    // r->q = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
+    // r->k = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
+    // r->v = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
 
     r->h1 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 256);
     r->h2 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 256);
     r->h3 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 256);
 
-    for (int i = 0; i < 4; ++i) {
-        r->qkvz[i] = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 12288);
-    }
-    r->ba = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 64);
+    // r->qkvz = (__bf16 *)aligned_malloc(64, 64 * sizeof(__bf16) * 12288);
+    // r->ba = (__bf16 *)aligned_malloc(64, 64 * sizeof(__bf16) * 64);
 
     r->layers = (struct RLayer *)calloc(sizeof(struct RLayer), c->n_layers);
 
@@ -1528,12 +1686,12 @@ void runtime_init(struct Transformer *xfmr) {
         r->layers[i].query = (struct Projection *)aligned_malloc(1, sizeof(struct Projection));
 
         r->layers[i].k_cumdecay = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
-        r->layers[i].v_prime = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
-        r->layers[i].v_new = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        // r->layers[i].v_prime = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        // r->layers[i].v_new = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
 
-        r->layers[i].last_recurrent_state = (struct RecurrentState *)calloc(1, sizeof(struct RecurrentState));
+        // r->layers[i].last_recurrent_state = (struct RecurrentState *)calloc(1, sizeof(struct RecurrentState));
 
-        r->layers[i].core_attn_out = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
+        // r->layers[i].core_attn_out = (struct ProjectionChunk *)calloc(chunks, sizeof(struct ProjectionChunk));
 
         r->layers[i].g = (struct DecayChunk *)calloc(chunks, sizeof(struct DecayChunk));
         r->layers[i].beta = (struct DecayChunk *)calloc(chunks, sizeof(struct DecayChunk));
@@ -1615,6 +1773,15 @@ void softmax(float *scores, size_t n) {
     }
 }
 
+__bf16 mlp[64][4096] __attribute__((aligned(64)));
+__bf16 mlp1[4096] __attribute__((aligned(64)));
+__bf16 mlp2[4096] __attribute__((aligned(64)));
+__bf16 mlp3[4096] __attribute__((aligned(64)));
+__bf16 mlp4[4096] __attribute__((aligned(64)));
+__bf16 expert_output[4096] __attribute__((aligned(64)));
+__bf16 seo[64][2048] __attribute__((aligned(64)));
+__bf16 logits[64][151936] = {};
+
 int main() {
 
     struct Transformer xfmr = {};
@@ -1630,190 +1797,238 @@ int main() {
 
     int attn_hiddn_size = c->n_heads * c->head_dim;
 
-    __bf16 *skip = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
-    __bf16 *embeddings = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
-    __bf16 *embeddings2 = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
-    __bf16 *embeddings3 = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
-    __bf16 *embeddings4 = aligned_malloc(64, sizeof(__bf16) * attn_hiddn_size);
-
-    __bf16 *mlp_embeddings = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
-    __bf16 *mlp_embeddings2 = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
-    __bf16 *mlp_embeddings3 = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
-    __bf16 *mlp_embeddings4 = aligned_malloc(64, sizeof(__bf16) * c->intermediate_size);
-    __bf16 *expert_output = aligned_malloc(64, sizeof(__bf16) * c->hidden_size * c->num_experts);
+    __bf16 residual[64][2048] __attribute__((aligned(64)));
+    __bf16 emb[64][2048] __attribute__((aligned(64)));
+    __bf16 emb2[64][2048] __attribute__((aligned(64)));
+    __bf16 emb3[64][2048] __attribute__((aligned(64)));
+    __bf16 emb4[64][2048] __attribute__((aligned(64)));
 
     int stop_tokens[3] = {151645, 151644, 151643};
 
-#if 0
+#if 1
     int *tokens = calloc(c->max_position_embeddings, sizeof(__bf16));
     // Read tokens from stdin
     char input_buffer[16384] = {};
+    int idx = 0;
     if (fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
         char *saveptr;
         char *tok = strtok_r(input_buffer, " \n", &saveptr);
-        int idx = 0;
         while (tok && idx < 16384) {
             tokens[idx++] = atoi(tok);
             tok = strtok_r(NULL, " \n", &saveptr);
         }
     }
+    int prompt_len = idx;
 #else
     int tokens[4096] = {151644, 872, 198, 285, 625, 1535, 264, 11580, 151645, 198, 151644, 77091, 198};
+    int prompt_len = 13;
 #endif
 
-    __bf16 cos[64] = {}, sin[64] = {};
+    __bf16 cos[64][64] = {}, sin[64][64] = {};
 
     clock_t start_time = clock(); // Start timing
 
     int pos = 0, prefill = 1;
-    while (pos + 1 < c->max_position_embeddings) {
+    while (pos + 1 < 1024) {
 
-        memcpy(embeddings, m->embeddings + tokens[pos] * c->hidden_size, c->hidden_size * sizeof(__bf16));
+        int n = prefill ? prompt_len : 1;
+        for (int i = 0; i < n; ++i) {
+            memcpy(emb[i], m->embeddings + tokens[pos + i] * c->hidden_size, c->hidden_size * sizeof(__bf16));
+        }
 
-        rope_forward(c, &c->d.rope, pos, cos, sin);
+        for (int i = 0; i < n; ++i) {
+            rope_forward(c, &c->d.rope, pos + i, cos[i], sin[i]);
+        }
 
         for (int k = 0; k < x->config.n_layers; k++) {
 
-            /* save skip */
-            memcpy(skip, embeddings, c->hidden_size * sizeof(__bf16));
+            /* save residual */
+            for (int i = 0; i < n; ++i) {
+                memcpy(residual[i], emb[i], c->hidden_size * sizeof(__bf16));
+            }
 
-            layernorm(embeddings2, embeddings, m->layers[k].input_layernorm, x);
+            for (int i = 0; i < n; ++i) {
+                layernorm(emb2[i], emb[i], m->layers[k].input_layernorm, x);
+            }
 
             if (m->layers[k].q_proj_w) {
-                self_attention(embeddings, embeddings2, x, k, pos, sin, cos);
+                self_attention(emb, emb2, x, k, pos, n, sin, cos);
             } else {
                 /* core_attn_out is 32x128, and we allocated 16x256 ... */
-                linear_attention(embeddings, embeddings2, x, k, pos, sin, cos, prefill);
+                linear_attention(emb, emb2, x, k, pos, n, sin, cos, prefill);
             }
 
-            /* residual */
-            add(embeddings2, embeddings, skip, c->hidden_size);
+            /* residual connection */
+            for (int i = 0; i < n; ++i) {
+                add(emb2[i], emb[i], residual[i], c->hidden_size);
+            }
 
-            /* save skip */
-            memcpy(skip, embeddings2, c->hidden_size * sizeof(__bf16));
+            /* save residual */
+            for (int i = 0; i < n; ++i) {
+                memcpy(residual[i], emb2[i], 2048 * sizeof(__bf16));
+            }
 
-            layernorm(embeddings, embeddings2, m->layers[k].post_attn_layernorm, x);
+            /* post layer norm */
+            for (int i = 0; i < n; ++i) {
+                layernorm(emb[i], emb2[i], m->layers[k].post_attn_layernorm, x);
+            }
 
             /* gate projection to find experts */
-            matmul(mlp_embeddings, embeddings, m->layers[k].gate, c->hidden_size, c->num_experts);
-
-            struct ExpertRank ranks[c->num_experts];
-            for (size_t i = 0; i < c->num_experts; ++i) {
-                ranks[i].index = i;
-                ranks[i].score = (float)mlp_embeddings[i];
+            for (int i = 0; i < n; ++i) {
+                matmul(mlp[i], emb[i], m->layers[k].gate, 2048, 512);
             }
 
-            qsort(ranks, c->num_experts, sizeof(struct ExpertRank), compare_expert_rank_desc);
-
-            __bf16 experts[c->num_experts_per_token][c->hidden_size] __attribute__((aligned(64))) = {};
-
-            for (size_t kk = 0; kk < c->num_experts_per_token; ++kk) {
-
-                int ex = ranks[kk].index;
-
-                /* gate projection */
-                matmul(mlp_embeddings, embeddings, m->layers[k].experts[ex].gate_proj, c->hidden_size,
-                       c->moe_intermediate_size);
-                silu_array(mlp_embeddings2, mlp_embeddings, c->moe_intermediate_size);
-
-                /* up projection */
-                matmul(mlp_embeddings3, embeddings, m->layers[k].experts[ex].up_proj, c->hidden_size,
-                       c->moe_intermediate_size);
-
-                /* hidden */
-                mul(mlp_embeddings, mlp_embeddings2, mlp_embeddings3, c->moe_intermediate_size);
-
-                /* down */
-                matmul(experts[kk], mlp_embeddings, m->layers[k].experts[ex].down_proj, c->moe_intermediate_size,
-                       c->hidden_size);
-
-                volatile int dummy = 0;
+            /* top k experts */
+            struct ExpertRank ranks[64][c->num_experts];
+            for (int i = 0; i < n; ++i) {
+                for (size_t j = 0; j < c->num_experts; ++j) {
+                    ranks[i][j].index = j;
+                    ranks[i][j].score = (float)mlp[i][j];
+                }
+                qsort(ranks[i], c->num_experts, sizeof(struct ExpertRank), compare_expert_rank_desc);
             }
 
-            float top_scores[c->num_experts_per_token] = {};
-            for (size_t i = 0; i < c->num_experts_per_token; ++i) {
-                top_scores[i] = ranks[i].score;
+            /* softmax over top k experts */
+            float routing_weights[64][c->num_experts_per_token] = {};
+            for (int i = 0; i < n; ++i) {
+                for (size_t j = 0; j < c->num_experts_per_token; ++j) {
+                    routing_weights[i][j] = ranks[i][j].score;
+                }
+                softmax(routing_weights[i], c->num_experts_per_token);
             }
-            softmax(top_scores, c->num_experts_per_token);
 
-            __bf16 combined[c->hidden_size] = {};
-            for (size_t k = 0; k < c->num_experts_per_token; ++k) {
-                for (size_t kk = 0; kk < c->hidden_size; ++kk) {
-                    combined[kk] += (__bf16)(top_scores[k] * (float)experts[k][kk]);
+            int tpe[512][64] = {};
+            int tpe_cnt[512] = {};
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < 10; ++j) {
+                    int expert = ranks[i][j].index;
+                    tpe[expert][tpe_cnt[expert]++] = i + 1;
                 }
             }
 
-            /* shared_expert_output = self.shared_expert(hidden_states) */
+            __bf16 final_hidden[64][2048] __attribute__((aligned(64))) = {};
 
-            /* gate projection + silu */
-            matmul(mlp_embeddings, embeddings, m->layers[k].shared_expert->gate_proj, c->hidden_size,
-                   c->moe_intermediate_size);
-            silu_array(mlp_embeddings2, mlp_embeddings, c->moe_intermediate_size);
+            for (int ex = 0; ex < 512; ++ex) {
+                for (int t = 0; t < tpe_cnt[ex]; ++t) {
+                    int i = tpe[ex][t] - 1;
 
-            /* up projectoin */
-            matmul(mlp_embeddings, embeddings, m->layers[k].shared_expert->up_proj, c->hidden_size,
-                   c->moe_intermediate_size);
+                    /* gate projection */
+                    matmul(mlp1, emb[i], m->layers[k].experts[ex].gate_proj, 2048, 512);
+                    silu_array(mlp2, mlp1, 512);
 
-            /* product */
-            mul(mlp_embeddings3, mlp_embeddings2, mlp_embeddings, c->moe_intermediate_size);
+                    /* up projection */
+                    matmul(mlp3, emb[i], m->layers[k].experts[ex].up_proj, 2048, 512);
 
-            /* down projection  */
-            matmul(embeddings2, mlp_embeddings3, m->layers[k].shared_expert->down_proj, c->moe_intermediate_size,
-                   c->hidden_size);
+                    /* hidden */
+                    mul(mlp1, mlp2, mlp3, 512);
+
+                    /* down */
+                    __bf16 final[2048] = {};
+                    matmul(final, mlp1, m->layers[k].experts[ex].down_proj, 512, 2048);
+
+                    /* search through the top k experts for this token to find the routing */
+                    int routing = -1;
+                    for (int j = 0; j < 10; ++j) {
+                        if (ranks[i][j].index == ex) {
+                            routing = j;
+                            break;
+                        }
+                    }
+
+                    /* scale by routing weight */
+                    float scale = routing_weights[i][routing];
+                    for (int j = 0; j < 2048; ++j) {
+                        final[j] *= scale;
+                    }
+
+                    /* accumulate */
+                    for (int j = 0; j < 2048; ++j) {
+                        final_hidden[i][j] += final[j];
+                    }
+                }
+            }
+
+            for (int i = 0; i < n; ++i) {
+
+                /* shared_expert_output = self.shared_expert(hidden_states) */
+
+                /* gate projection + silu */
+                matmul(mlp1, emb[i], m->layers[k].shared_expert->gate_proj, c->hidden_size, c->moe_intermediate_size);
+                silu_array(mlp2, mlp1, c->moe_intermediate_size);
+
+                /* up projection */
+                matmul(mlp1, emb[i], m->layers[k].shared_expert->up_proj, c->hidden_size, c->moe_intermediate_size);
+
+                /* product */
+                mul(mlp3, mlp2, mlp1, c->moe_intermediate_size);
+
+                /* down projection  */
+                matmul(seo[i], mlp3, m->layers[k].shared_expert->down_proj, c->moe_intermediate_size, c->hidden_size);
+            }
 
             /*
              * embeddings -> hidden
              * embeddings2 -> shared_expert_output
              */
 
-            /* shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output */
+            __bf16 gate[64] = {};
+            for (int i = 0; i < n; ++i) {
+                /* shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output */
+                /* gate projection */
+                matmul(&gate[i], emb[i], m->layers[k].shared_expert->gate, 2048, 1);
+                gate[i] = sigmoid(gate[i]);
+            }
 
-            /* gate projection */
-            __bf16 gate = 0;
-            matmul(&gate, embeddings, m->layers[k].shared_expert->gate, 2048, 1);
-            gate = sigmoid(gate);
+            for (int i = 0; i < n; ++i) {
+                mul_scalar(seo[i], seo[i], gate[i], c->hidden_size);
+            }
 
-            mul_scalar(embeddings, embeddings2, gate, c->hidden_size);
+            for (int i = 0; i < n; ++i) {
+                /* final_hidden_states = final_hidden_states + shared_expert_output */
+                add(final_hidden[i], final_hidden[i], seo[i], c->hidden_size);
+            }
 
-            /* final_hidden_states = final_hidden_states + shared_expert_output */
-            add(embeddings2, combined, embeddings, c->hidden_size);
-
-            add(embeddings, embeddings2, skip, c->hidden_size);
-
-            volatile int dummy = 0;
-        }
-
-        layernorm(embeddings2, embeddings, m->final_layernorm, x);
-
-        __bf16 logits[c->vocab_size] = {};
-
-        const __bf16 *weights = !m->lm_head ? m->embeddings : m->lm_head;
-        matmul(logits, embeddings2, weights, c->hidden_size, c->vocab_size);
-
-        // Generate prediction: pick argmax from logits
-        int predict = 0;
-        float max = (float)logits[0];
-        for (int i = 1; i < c->vocab_size; i++) {
-            if ((float)logits[i] > max) {
-                max = (float)logits[i];
-                predict = i;
+            for (int i = 0; i < n; ++i) {
+                add(emb[i], final_hidden[i], residual[i], c->hidden_size);
             }
         }
-        if (tokens[pos + 1] == 0) {
-            tokens[pos + 1] = predict;
+
+        for (int i = 0; i < n; ++i) {
+            layernorm(emb2[i], emb[i], m->final_layernorm, x);
+        }
+
+        const __bf16 *weights = !m->lm_head ? m->embeddings : m->lm_head;
+        for (int i = 0; i < n; ++i) {
+            matmul(logits[i], emb2[i], weights, c->hidden_size, c->vocab_size);
+        }
+
+        // Generate prediction: pick argmax from logits
+        int predict[64] = {};
+        for (int i = 0; i < n; ++i) {
+            float max = (float)logits[i][0];
+            for (int j = 1; j < c->vocab_size; j++) {
+                if ((float)logits[i][j] > max) {
+                    max = (float)logits[i][j];
+                    predict[i] = j;
+                }
+            }
+        }
+        if (tokens[pos + n] == 0) {
+            tokens[pos + n] = predict[n - 1];
             prefill = 0;
 
-            if (tokens[pos + 1] == stop_tokens[0] || tokens[pos + 1] == stop_tokens[1] ||
-                tokens[pos + 1] == stop_tokens[2]) {
+            if (tokens[pos + n] == stop_tokens[0] || tokens[pos + 1] == stop_tokens[1] ||
+                tokens[pos + n] == stop_tokens[2]) {
                 // terminate if we see stop token
                 break;
             }
         }
 
-        printf("%s", x->runtime.lookup[tokens[pos + 1]]);
+        printf("%s", x->runtime.lookup[tokens[pos + n]]);
         fflush(stdout);
 
-        ++pos;
+        pos += n;
+        // printf("## pos: %d\n", pos);
     }
 
     clock_t end_time = clock(); // End timing
