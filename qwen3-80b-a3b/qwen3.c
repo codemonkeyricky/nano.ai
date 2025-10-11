@@ -117,7 +117,7 @@ struct RLayer {
     Head *value_cache;
 
     /* linear attention */
-    __bf16 mixed_qkv_raw[64][8192]; /* +4 for the convolution kernel size */
+    __bf16 mixed_qkv_raw[64][8192];
     __bf16 mixed_qkv[64][8192];
     struct Projection *query;
     struct AttentionChunk *attn_cache;
@@ -142,14 +142,16 @@ struct RLayer {
     float core_attn_out[32][64][128];
     __bf16 core_attn_out_bf16[32][64][128];
     __bf16 z[64][32][128];
+
+    float q[16][1024][256];
+    float k[2][1024][256];
+    float v[2][1024][256];
+    float attn[16][1024][1024];
 };
 
 struct Runtime {
     __bf16 *qg;
     __bf16 *gate;
-    __bf16 *q;
-    __bf16 *k;
-    __bf16 *v;
     __bf16 *h1;
     __bf16 *h2;
     __bf16 *h3;
@@ -565,7 +567,7 @@ void layernorm(__bf16 *out, const __bf16 *in, const __bf16 *weight, struct Trans
 
 float dot_f32(float *__restrict x, float *__restrict w, int n) {
 
-    assert(n % 32 == 0);
+    // assert(n % 32 == 0);
 
     // x = __builtin_assume_aligned(x, 64);
     // w = __builtin_assume_aligned(w, 64);
@@ -625,7 +627,7 @@ void matmul_bias_f32(float *__restrict out, const float *__restrict x, const flo
     // out = __builtin_assume_aligned(out, 64);
     // x = __builtin_assume_aligned(x, 64);
     // w = __builtin_assume_aligned(w, 64);
-    assert(n % 32 == 0);
+    // assert(n % 32 == 0);
     // assert(d % 32 == 0);
     int i;
     // #pragma omp parallel for private(i)
@@ -681,7 +683,7 @@ __bf16 key_state[2][64][256];
 __bf16 value_state[2][64][256];
 
 void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
-                    const int n, __bf16 sin[64][64], __bf16 cos[64][64]) {
+                    const int p, const int n, __bf16 sin[64][64], __bf16 cos[64][64]) {
     struct query_gate {
         __bf16 q[256];
         __bf16 gate[256];
@@ -691,7 +693,7 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
         __bf16 block[256];
     };
 
-    struct Config *p = &xfmr->config;
+    struct Config *c = &xfmr->config;
     const struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
 
@@ -774,16 +776,14 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
 
     static float y[16][64][256];
     {
-        static float q[16][64][256];
-        static float k[2][64][256];
-        static float v[2][64][256];
-
-        memset(v, 0, sizeof(v));
+        float (*q)[1024][256] = r->layers[layer].q;
+        float (*k)[1024][256] = r->layers[layer].k;
+        float (*v)[1024][256] = r->layers[layer].v;
 
         for (int h = 0; h < 16; ++h) {
             for (int i = 0; i < n; ++i) {
                 for (int j = 0; j < 256; ++j) {
-                    q[h][i][j] = (float)query_state[h][i][j];
+                    q[h][p + i][j] = (float)query_state[h][i][j];
                 }
             }
         }
@@ -791,36 +791,28 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
         for (int h = 0; h < 2; ++h) {
             for (int i = 0; i < n; ++i) {
                 for (int j = 0; j < 256; ++j) {
-                    k[h][i][j] = (float)key_state[h][i][j];
-                    v[h][i][j] = (float)value_state[h][i][j];
+                    k[h][p + i][j] = (float)key_state[h][i][j];
+                    v[h][p + i][j] = (float)value_state[h][i][j];
                 }
             }
         }
 
-        float attn[16][64][64] = {};
+        /* process up to 64 at a time */
+        float (*attn)[1024][1024] = r->layers[layer].attn;
 
         /* att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) */
         for (int h = 0; h < 16; ++h) {
             for (int i = 0; i < n; ++i) {
-                /* 1x256 @ 64x256 */
-                matmul_f32(attn[h][i], q[h][i], (float *)k[h / 8], 256, 64);
+                /* 1x256 @ (p+1)x256 */
+                matmul_f32(attn[h][p + i], q[h][p + i], (float *)k[h / 8], 256, p + i + 1);
             }
         }
 
         /* scale */
         for (int h = 0; h < 16; ++h) {
             for (int i = 0; i < n; ++i) {
-                for (int j = 0; j < 64; ++j) {
-                    attn[h][i][j] *= 0.0625f;
-                }
-            }
-        }
-
-        /* clear upper right for easier debug */
-        for (int h = 0; h < 16; ++h) {
-            for (int i = 0; i < n; ++i) {
-                for (int j = i + 1; j < 64; ++j) {
-                    attn[h][i][j] = 0;
+                for (int j = 0; j < p + i + 1; ++j) {
+                    attn[h][p + i][j] *= 0.0625f;
                 }
             }
         }
@@ -828,31 +820,34 @@ void self_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tran
         /* soft max */
         for (int h = 0; h < 16; ++h) {
             for (int i = 0; i < n; ++i) {
-                float max_att = attn[h][i][0];
-                for (int j = 0; j <= i; j++) {
-                    if (attn[h][i][j] > max_att)
-                        max_att = attn[h][i][j];
+                float max_att = attn[h][p + i][0];
+                for (int j = 0; j <= p + i; j++) {
+                    if (attn[h][p + i][j] > max_att)
+                        max_att = attn[h][p + i][j];
                 }
                 float sum_exp = 0.0f;
-                for (int j = 0; j <= i; j++) {
-                    attn[h][i][j] = expf(attn[h][i][j] - max_att);
-                    sum_exp += attn[h][i][j];
+                for (int j = 0; j <= p + i; j++) {
+                    attn[h][p + i][j] = expf(attn[h][p + i][j] - max_att);
+                    sum_exp += attn[h][p + i][j];
                 }
-                for (int j = 0; j <= i; j++) {
-                    attn[h][i][j] /= sum_exp;
+                for (int j = 0; j <= p + i; j++) {
+                    attn[h][p + i][j] /= sum_exp;
                 }
             }
         }
 
         /* attention is 16x64x64, v is 2x64x256 */
-        float v_t[2][256][64];
+        static float vt_storage[2][256][1024];
+        float (*vt)[256][p + n] = (__typeof__(vt))vt_storage;
+
         for (int h = 0; h < 2; ++h) {
-            transpose((float *)v_t[h], (float *)v[h], 64, 256);
+            /* (*v)[1024][256] */
+            transpose((float *)vt[h], (float *)v[h], p + n, 256);
         }
 
         for (int h = 0; h < 16; ++h) {
             for (int i = 0; i < n; ++i) {
-                matmul_f32((float *)y[h][i], attn[h][i], (float *)v_t[h / 8], 64, 256);
+                matmul_f32((float *)y[h][i], attn[h][p + i], (float *)vt[h / 8], p + n, 256);
             }
         }
     }
@@ -1667,10 +1662,10 @@ void runtime_init(struct Transformer *xfmr) {
     int sz = c->head_dim * c->kv_heads;
 
     r->qg = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
-    r->q = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
     r->gate = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
-    r->k = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
-    r->v = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
+    // r->q = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
+    // r->k = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
+    // r->v = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 8192);
 
     r->h1 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 256);
     r->h2 = (__bf16 *)aligned_malloc(64, sizeof(__bf16) * 256);
@@ -1837,7 +1832,7 @@ int main() {
     clock_t start_time = clock(); // Start timing
 
     int pos = 0, prefill = 1;
-    while (pos + 1 < c->max_position_embeddings) {
+    while (pos + 1 < 1024) {
 
         int n = prefill ? prompt_len : 1;
         for (int i = 0; i < n; ++i) {
@@ -1860,7 +1855,7 @@ int main() {
             }
 
             if (m->layers[k].q_proj_w) {
-                self_attention(emb, emb2, x, k, n, sin, cos);
+                self_attention(emb, emb2, x, k, pos, n, sin, cos);
             } else {
                 /* core_attn_out is 32x128, and we allocated 16x256 ... */
                 linear_attention(emb, emb2, x, k, pos, n, sin, cos, prefill);
