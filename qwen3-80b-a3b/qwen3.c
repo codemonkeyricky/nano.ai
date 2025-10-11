@@ -1083,8 +1083,6 @@ void recurrent_gated_delta_rule(float q[32][128], float k[32][128], float v[32][
             }
         }
     }
-
-    volatile int dummy = 0;
 }
 
 void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Transformer *xfmr, const int layer,
@@ -1096,10 +1094,9 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
     if (p == 64) {
         volatile int dummy = 0;
     }
-    // int pp = pos % 4;
 
-    volatile __bf16 (*qkvz)[12288] = (__bf16 (*)[12288])r->qkvz;
-    volatile __bf16 (*ba)[16][4] = (__bf16 (*)[16][4])r->ba;
+    __bf16 (*qkvz)[12288] = (__bf16 (*)[12288])r->qkvz;
+    __bf16 (*ba)[16][4] = (__bf16 (*)[16][4])r->ba;
 
     /* qkvz and ba projection */
     for (int i = 0; i < n; ++i) {
@@ -1113,7 +1110,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
     /* Convert from interleaved to concatenated format */
 
-    volatile __bf16 (*raw)[8192] = r->layers[layer].mixed_qkv_raw;
+    __bf16 (*raw)[8192] = r->layers[layer].mixed_qkv_raw;
 
     for (int kk = p; kk < p + n; ++kk) {
 
@@ -1808,7 +1805,7 @@ int main() {
 
     int stop_tokens[3] = {151645, 151644, 151643};
 
-#if 0
+#if 1
     int *tokens = calloc(c->max_position_embeddings, sizeof(__bf16));
     // Read tokens from stdin
     char input_buffer[16384] = {};
@@ -1831,7 +1828,7 @@ int main() {
 
     clock_t start_time = clock(); // Start timing
 
-    volatile int pos = 0, prefill = 1;
+    int pos = 0, prefill = 1;
     while (pos + 1 < 1024) {
 
         int n = prefill ? prompt_len : 1;
@@ -1994,8 +1991,6 @@ int main() {
             for (int i = 0; i < n; ++i) {
                 add(emb[i], final_hidden[i], residual[i], c->hidden_size);
             }
-
-            volatile int z = 0;
         }
 
         for (int i = 0; i < n; ++i) {
@@ -2025,7 +2020,6 @@ int main() {
             if (tokens[pos + n] == stop_tokens[0] || tokens[pos + 1] == stop_tokens[1] ||
                 tokens[pos + n] == stop_tokens[2]) {
                 // terminate if we see stop token
-                volatile int dummy = 0;
                 break;
             }
         }
