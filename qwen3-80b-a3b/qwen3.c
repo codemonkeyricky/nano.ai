@@ -988,6 +988,7 @@ void rmsnorm_gated(__bf16 *xout, __bf16 *tmp, __bf16 *zz, __bf16 *w, int n_heads
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
+#pragma GCC pop_options
 
 void recurrent_gated_delta_rule(float q[32][128], float k[32][128], float v[32][128], float g[32], float beta[32],
                                 int layer, int pos, int n, const struct Transformer *xfmr) {
@@ -1625,8 +1626,6 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
         matmul(xout[i], post_lan[i], m->layers[layer].linear_attn_out_proj_w, 4096, 2048);
     }
 }
-
-#pragma GCC pop_options
 
 void *aligned_malloc(size_t alignment, size_t size) {
 
