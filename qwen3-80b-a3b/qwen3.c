@@ -1093,13 +1093,13 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
     struct Runtime *r = &xfmr->runtime;
     const struct Mmapping *m = &xfmr->mmapping;
 
-    if (n == 1) {
+    if (p == 64) {
         volatile int dummy = 0;
     }
     // int pp = pos % 4;
 
-    __bf16 (*qkvz)[12288] = (__bf16 (*)[12288])r->qkvz;
-    __bf16 (*ba)[16][4] = (__bf16 (*)[16][4])r->ba;
+    volatile __bf16 (*qkvz)[12288] = (__bf16 (*)[12288])r->qkvz;
+    volatile __bf16 (*ba)[16][4] = (__bf16 (*)[16][4])r->ba;
 
     /* qkvz and ba projection */
     for (int i = 0; i < n; ++i) {
@@ -1113,7 +1113,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
 
     /* Convert from interleaved to concatenated format */
 
-    __bf16 (*raw)[8192] = r->layers[layer].mixed_qkv_raw;
+    volatile __bf16 (*raw)[8192] = r->layers[layer].mixed_qkv_raw;
 
     for (int kk = p; kk < p + n; ++kk) {
 
@@ -1152,7 +1152,7 @@ void linear_attention(__bf16 xout[64][2048], __bf16 x[64][2048], const struct Tr
                 __bf16 c2 = w[i].w[k];
                 tmp += c1 * c2;
             }
-            mixed[pp][i] = tmp;
+            mixed[pp % 64][i] = tmp;
         }
     }
 
@@ -1812,15 +1812,16 @@ int main() {
     int *tokens = calloc(c->max_position_embeddings, sizeof(__bf16));
     // Read tokens from stdin
     char input_buffer[16384] = {};
+    int idx = 0;
     if (fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
         char *saveptr;
         char *tok = strtok_r(input_buffer, " \n", &saveptr);
-        int idx = 0;
         while (tok && idx < 16384) {
             tokens[idx++] = atoi(tok);
             tok = strtok_r(NULL, " \n", &saveptr);
         }
     }
+    int prompt_len = idx;
 #else
     int tokens[4096] = {151644, 872, 198, 285, 625, 1535, 264, 11580, 151645, 198, 151644, 77091, 198};
     int prompt_len = 13;
@@ -1830,7 +1831,7 @@ int main() {
 
     clock_t start_time = clock(); // Start timing
 
-    int pos = 0, prefill = 1;
+    volatile int pos = 0, prefill = 1;
     while (pos + 1 < 1024) {
 
         int n = prefill ? prompt_len : 1;
@@ -2024,6 +2025,7 @@ int main() {
             if (tokens[pos + n] == stop_tokens[0] || tokens[pos + 1] == stop_tokens[1] ||
                 tokens[pos + n] == stop_tokens[2]) {
                 // terminate if we see stop token
+                volatile int dummy = 0;
                 break;
             }
         }
@@ -2032,6 +2034,7 @@ int main() {
         fflush(stdout);
 
         pos += n;
+        // printf("## pos: %d\n", pos);
     }
 
     clock_t end_time = clock(); // End timing
